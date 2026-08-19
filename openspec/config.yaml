@@ -1,0 +1,35 @@
+schema: spec-driven
+
+context: |
+  Project: developer-helper-tg-bot — Telegram bot that forwards user messages
+  to a local LLM and returns the model's reply. Course homework, 3-month learning horizon.
+  Tech stack: Python 3.11+, aiogram 3.x (async), aiohttp for LLM calls, python-dotenv.
+  LLM backend: LM Studio exposing an OpenAI-compatible endpoint (default :1234/v1),
+  model Llama-3.2-3B-Instruct-4bit. LLM access is isolated behind an LLMClient seam
+  so providers can be swapped via .env without touching bot code.
+  Transport: long-polling via aiogram's Dispatcher.start_polling (no webhooks).
+  Reply mode: one-shot, no dialog memory (each message is an independent request).
+  Secrets: TELEGRAM_BOT_TOKEN and LLM config live in .env, never committed.
+  Language for artifacts and comments: Russian is acceptable; keep code identifiers in English.
+
+# Per-artifact rules (optional)
+# Add custom rules for specific artifacts.
+# Example:
+#   rules:
+#     proposal:
+#       - Keep proposals under 500 words
+#       - Always include a "Non-goals" section
+#     tasks:
+#       - Break tasks into chunks of max 2 hours
+
+# Per-operation guidance (optional)
+# Add advisory guidance for how apply and archive work should be conducted.
+# This is separate from artifact rules above.
+# Example:
+#   operations:
+#     apply:
+#       guidance:
+#         - Keep test summaries concise
+#     archive:
+#       guidance:
+#         - Summarize the archive outcome before finishing
