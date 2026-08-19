@@ -7,9 +7,3 @@ __all__ = [
     "Message",
     "OpenAICompatibleClient",
 ]
-
-
-def make_llm() -> LLMClient:
-    from config import make_llm as _make_llm
-
-    return _make_llm()

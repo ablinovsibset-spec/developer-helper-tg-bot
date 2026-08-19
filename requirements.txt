@@ -1,3 +1,6 @@
+# Источник истины о зависимостях — pyproject.toml ([project].dependencies).
+# Этот файл оставлен для удобной установки: pip install -r requirements.txt.
+# При изменении зависимостей обновляйте оба файла согласованно.
 aiogram>=3.0,<4.0
 python-dotenv>=1.0
 aiohttp>=3.9
