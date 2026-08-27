@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import os
 
-from llm import LLMClient, LLMUnavailable
-from llm.openai_compat import OpenAICompatibleClient
+from dev_helper_bot.llm import LLMClient, LLMUnavailable
+from dev_helper_bot.llm.openai_compat import OpenAICompatibleClient
 
 DEFAULT_BASE_URL = "http://localhost:1234/v1"
 DEFAULT_MODEL = "Llama-3.2-3B-Instruct-4bit"

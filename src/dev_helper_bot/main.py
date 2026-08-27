@@ -9,8 +9,8 @@ from aiogram.enums import ParseMode
 from aiogram.types import Message as TgMessage
 from dotenv import load_dotenv
 
-from config import make_llm, telegram_token
-from llm import LLMClient, LLMUnavailable, Message
+from dev_helper_bot.config import make_llm, telegram_token
+from dev_helper_bot.llm import LLMClient, LLMUnavailable, Message
 
 TELEGRAM_MESSAGE_LIMIT = 4096
 
@@ -65,4 +65,9 @@ async def main() -> None:
 
 
 if __name__ == "__main__":
+    asyncio.run(main())
+
+
+def cli() -> None:
+    """Synchronous entry point for the `dev-helper-bot` console script."""
     asyncio.run(main())
