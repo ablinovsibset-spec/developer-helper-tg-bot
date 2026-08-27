@@ -30,7 +30,7 @@ def make_llm() -> LLMClient:
 
 
 def telegram_token() -> str:
-    token = os.getenv("TELEGRAM_BOT_TOKEN")
+    token = os.get/env("TELEGRAM_BOT_TOKEN")
     if not token:
         raise SystemExit(
             "TELEGRAM_BOT_TOKEN is not set. "
