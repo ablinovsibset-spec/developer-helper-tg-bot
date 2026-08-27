@@ -16,7 +16,7 @@ Telegram-бот, который пересылает сообщения поль
 git clone <url-репозитория>
 cd developer-helper-tg-bot
 
-python3.11 -m venv .venv
+python3 -m venv .venv
 source .venv/bin/activate      # Windows: .venv\Scripts\activate
 
 pip install -e .               # вариант 1: editable-установка (рекомендуется)
