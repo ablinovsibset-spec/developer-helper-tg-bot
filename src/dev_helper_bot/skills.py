@@ -1,9 +1,20 @@
 from __future__ import annotations
 
+from datetime import datetime
 from pathlib import Path
 
 REASONING_EFFORT_LINE = "Reasoning: medium"
 SKILLS_DIR_NAME = "skills"
+
+WEEKDAYS = (
+    "понедельник",
+    "вторник",
+    "среда",
+    "четверг",
+    "пятница",
+    "суббота",
+    "воскресенье",
+)
 
 
 def default_skills_dir() -> Path:
@@ -24,13 +35,20 @@ def load_skills(skills_dir: Path) -> dict[str, str]:
     }
 
 
-def build_system_prompt(skills: dict[str, str]) -> str:
-    """Склейка системного промпта: Reasoning: medium + секции скиллов."""
-    sections = [REASONING_EFFORT_LINE]
+def datetime_line(now: datetime) -> str:
+    """Строка даты/времени для промпта: дата, минуты и день недели."""
+    return f"Текущие дата и время: {now:%Y-%m-%d %H:%M} ({WEEKDAYS[now.weekday()]})"
+
+
+def build_system_prompt(skills: dict[str, str], now: datetime | None = None) -> str:
+    """Склейка системного промпта: reasoning, дата/время, секции скиллов."""
+    if now is None:
+        now = datetime.now()
+    sections = [f"{REASONING_EFFORT_LINE}\n{datetime_line(now)}"]
     for name, content in skills.items():
         sections.append(f"## {name}\n{content}")
     return "\n\n".join(sections)
 
 
-def system_prompt_from_dir(skills_dir: Path) -> str:
-    return build_system_prompt(load_skills(skills_dir))
+def system_prompt_from_dir(skills_dir: Path, now: datetime | None = None) -> str:
+    return build_system_prompt(load_skills(skills_dir), now)

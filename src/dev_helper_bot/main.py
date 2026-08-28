@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from datetime import datetime
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
@@ -13,7 +14,7 @@ from dotenv import load_dotenv
 from dev_helper_bot.agent import run_agent
 from dev_helper_bot.config import make_llm, telegram_token
 from dev_helper_bot.llm import LLMClient, LLMUnavailable, Message
-from dev_helper_bot.skills import default_skills_dir, system_prompt_from_dir
+from dev_helper_bot.skills import build_system_prompt, default_skills_dir, load_skills
 from dev_helper_bot.tools import EXEC_TOOL_SPEC
 
 TELEGRAM_MESSAGE_LIMIT = 4096
@@ -38,11 +39,13 @@ async def send_chunked(bot: Bot, chat_id: int, text: str) -> None:
 def chat_history(
     histories: ChatHistories, chat_id: int, system_prompt: str
 ) -> list[Message]:
-    """История чата; системный промпт — первым сообщением каждого контекста."""
+    """История чата; системное сообщение обновляется актуальным промптом."""
     history = histories.get(chat_id)
     if not history:
         history = [{"role": "system", "content": system_prompt}]
         histories[chat_id] = history
+    else:
+        history[0]["content"] = system_prompt
     return history
 
 
@@ -51,8 +54,9 @@ async def handle_text(
     bot: Bot,
     llm: LLMClient,
     histories: ChatHistories,
-    system_prompt: str,
+    skills: dict[str, str],
 ) -> None:
+    system_prompt = build_system_prompt(skills, datetime.now())
     history = chat_history(histories, message.chat.id, system_prompt)
     history.append({"role": "user", "content": message.text or ""})
 
@@ -83,7 +87,6 @@ async def main() -> None:
     load_dotenv()
     token = telegram_token()
     llm = make_llm()
-    system_prompt = system_prompt_from_dir(default_skills_dir())
 
     bot = Bot(
         token=token,
@@ -92,7 +95,7 @@ async def main() -> None:
     dp = Dispatcher()
     dp["llm"] = llm
     dp["histories"] = {}
-    dp["system_prompt"] = system_prompt
+    dp["skills"] = load_skills(default_skills_dir())
     dp.message.register(handle_new, Command("new"))
     dp.message.register(handle_text, F.text)
 
