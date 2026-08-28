@@ -1,47 +1,196 @@
 from __future__ import annotations
 
+from datetime import datetime
+
 import pytest
 
+from dev_helper_bot import main as main_module
+from dev_helper_bot.agent import STEPS_EXHAUSTED_MESSAGE
 from dev_helper_bot.llm import LLMUnavailable
-from dev_helper_bot.main import TELEGRAM_MESSAGE_LIMIT, handle_text, send_chunked
+from dev_helper_bot.main import (
+    NEW_CHAT_CONFIRMATION,
+    TELEGRAM_MESSAGE_LIMIT,
+    WAITING_MESSAGE,
+    handle_new,
+    handle_text,
+    send_chunked,
+)
+from dev_helper_bot.tools import EXEC_TOOL_SPEC
 
-from tests.conftest import FakeMessage, make_llm_stub
+from tests.conftest import FakeMessage, assistant_turn, make_llm_stub, make_scripted_llm, tool_call
 
 CHAT_ID = 42
+SKILLS = {"wttr-in-api": "Правила wttr.in"}
+T1 = datetime(2026, 8, 28, 7, 45)
+T2 = datetime(2026, 8, 28, 7, 47)
+SYSTEM_AT_T1 = (
+    "Reasoning: medium\nТекущие дата и время: 2026-08-28 07:45 (пятница)"
+    "\n\n## wttr-in-api\nПравила wttr.in"
+)
+SYSTEM_AT_T2 = (
+    "Reasoning: medium\nТекущие дата и время: 2026-08-28 07:47 (пятница)"
+    "\n\n## wttr-in-api\nПравила wttr.in"
+)
 
 
-async def test_handle_text_forwards_prompt_and_replies_to_same_chat(
-    fake_bot,
-):
+def fake_datetime(*times: datetime):
+    """datetime-заглушка: now() по очереди возвращает заданные моменты."""
+
+    class FakeDatetime(datetime):
+        _times = list(times)
+
+        @classmethod
+        def now(cls, tz=None):
+            return cls._times.pop(0)
+
+    return FakeDatetime
+
+
+async def handle(message, fake_bot, llm, histories=None, skills=SKILLS):
+    histories = histories if histories is not None else {}
+    await handle_text(message, fake_bot, llm, histories, skills)
+    return histories
+
+
+async def test_handle_text_sends_waiting_then_final_reply(fake_bot):
     llm = make_llm_stub(reply="ответ модели")
-    message = FakeMessage("привет", chat_id=CHAT_ID)
 
-    await handle_text(message, fake_bot, llm)
+    await handle(FakeMessage("привет", chat_id=CHAT_ID), fake_bot, llm)
 
-    assert llm.requests == [[{"role": "user", "content": "привет"}]]
-    assert fake_bot.sent == [{"chat_id": CHAT_ID, "text": "ответ модели"}]
+    assert fake_bot.sent == [
+        {"chat_id": CHAT_ID, "text": WAITING_MESSAGE},
+        {"chat_id": CHAT_ID, "text": "ответ модели"},
+    ]
+
+
+async def test_handle_text_prompt_goes_to_llm_with_system_and_tools(
+    fake_bot, monkeypatch
+):
+    llm = make_llm_stub(reply="ok")
+    monkeypatch.setattr(main_module, "datetime", fake_datetime(T1))
+
+    await handle(FakeMessage("привет", chat_id=CHAT_ID), fake_bot, llm)
+
+    assert llm.requests[0] == [
+        {"role": "system", "content": SYSTEM_AT_T1},
+        {"role": "user", "content": "привет"},
+    ]
+    assert llm.tools_per_request == [[EXEC_TOOL_SPEC]]
 
 
 async def test_handle_text_llm_unavailable_sends_friendly_error(fake_bot):
     llm = make_llm_stub(error=LLMUnavailable("connection refused"))
-    message = FakeMessage("привет", chat_id=CHAT_ID)
 
-    await handle_text(message, fake_bot, llm)
+    await handle(FakeMessage("привет", chat_id=CHAT_ID), fake_bot, llm)
 
-    assert len(fake_bot.sent) == 1
-    assert CHAT_ID == fake_bot.sent[0]["chat_id"]
-    assert "недоступна" in fake_bot.sent[0]["text"]
+    assert len(fake_bot.sent) == 2  # ⏳ и сообщение об ошибке
+    assert fake_bot.sent[-1]["chat_id"] == CHAT_ID
+    assert "недоступна" in fake_bot.sent[-1]["text"]
 
 
-async def test_handle_text_no_memory_between_messages(fake_bot):
-    llm = make_llm_stub(reply="ok")
+async def test_context_is_kept_between_messages(fake_bot, monkeypatch):
+    llm = make_llm_stub(reply="первый ответ")
+    monkeypatch.setattr(main_module, "datetime", fake_datetime(T1, T2))
+    histories = await handle(
+        FakeMessage("первое", chat_id=CHAT_ID), fake_bot, llm
+    )
 
-    await handle_text(FakeMessage("первое", chat_id=CHAT_ID), fake_bot, llm)
-    await handle_text(FakeMessage("второе", chat_id=CHAT_ID), fake_bot, llm)
+    llm.turns = [assistant_turn("второй ответ")]
+    await handle(FakeMessage("второе", chat_id=CHAT_ID), fake_bot, llm, histories)
 
-    assert llm.requests == [
-        [{"role": "user", "content": "первое"}],
-        [{"role": "user", "content": "второе"}],
+    assert llm.requests[1] == [
+        {"role": "system", "content": SYSTEM_AT_T2},
+        {"role": "user", "content": "первое"},
+        {"role": "assistant", "content": "первый ответ"},
+        {"role": "user", "content": "второе"},
+    ]
+
+
+async def test_system_message_is_refreshed_between_messages(fake_bot, monkeypatch):
+    llm = make_llm_stub(reply="первый ответ")
+    monkeypatch.setattr(main_module, "datetime", fake_datetime(T1, T2))
+    histories = await handle(
+        FakeMessage("первое", chat_id=CHAT_ID), fake_bot, llm
+    )
+
+    assert histories[CHAT_ID][0] == {"role": "system", "content": SYSTEM_AT_T1}
+
+    llm.turns = [assistant_turn("второй ответ")]
+    await handle(FakeMessage("второе", chat_id=CHAT_ID), fake_bot, llm, histories)
+
+    assert histories[CHAT_ID][0] == {"role": "system", "content": SYSTEM_AT_T2}
+    assert [m["role"] for m in histories[CHAT_ID]] == [
+        "system",
+        "user",
+        "assistant",
+        "user",
+        "assistant",
+    ]
+    assert histories[CHAT_ID][1:] == [
+        {"role": "user", "content": "первое"},
+        {"role": "assistant", "content": "первый ответ"},
+        {"role": "user", "content": "второе"},
+        {"role": "assistant", "content": "второй ответ"},
+    ]
+
+
+async def test_tool_transcript_is_kept_in_history(fake_bot):
+    llm = make_scripted_llm(
+        [
+            assistant_turn(
+                content=None,
+                tool_calls=[tool_call(arguments='{"command": "echo hi"}')],
+                finish_reason="tool_calls",
+            ),
+            assistant_turn(content="готово"),
+        ]
+    )
+
+    histories = await handle(
+        FakeMessage("запрос", chat_id=CHAT_ID), fake_bot, llm
+    )
+
+    second_request = llm.requests[1]
+    roles = [m["role"] for m in second_request]
+    assert roles == ["system", "user", "assistant", "tool"]
+    assert "echo hi" in second_request[2]["tool_calls"][0]["arguments"]
+    assert "hi" in second_request[3]["content"]
+    assert "reasoning" not in histories[CHAT_ID][2]
+    assert histories[CHAT_ID][-1] == {"role": "assistant", "content": "готово"}
+
+
+async def test_steps_exhausted_message_is_sent_to_chat(fake_bot):
+    endless = assistant_turn(
+        content=None,
+        tool_calls=[tool_call(arguments='{"command": "echo x"}')],
+        finish_reason="tool_calls",
+    )
+    llm = make_scripted_llm([endless])
+
+    await handle(FakeMessage("сложный запрос", chat_id=CHAT_ID), fake_bot, llm)
+
+    assert fake_bot.sent[-1]["text"] == STEPS_EXHAUSTED_MESSAGE
+
+
+async def test_new_command_resets_context_without_llm_call(fake_bot, monkeypatch):
+    llm = make_llm_stub(reply="ответ")
+    monkeypatch.setattr(main_module, "datetime", fake_datetime(T1, T2))
+    histories = await handle(
+        FakeMessage("первое", chat_id=CHAT_ID), fake_bot, llm
+    )
+    llm.requests.clear()
+
+    await handle_new(FakeMessage("/new", chat_id=CHAT_ID), fake_bot, histories)
+
+    assert fake_bot.sent[-1] == {"chat_id": CHAT_ID, "text": NEW_CHAT_CONFIRMATION}
+    assert llm.requests == []  # LLM не вызывался
+
+    llm.turns = [assistant_turn("новый ответ")]
+    await handle(FakeMessage("второе", chat_id=CHAT_ID), fake_bot, llm, histories)
+
+    assert llm.requests[0] == [
+        {"role": "system", "content": SYSTEM_AT_T2},
+        {"role": "user", "content": "второе"},
     ]
 
 

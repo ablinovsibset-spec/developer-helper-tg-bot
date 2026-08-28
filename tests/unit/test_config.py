@@ -26,6 +26,12 @@ def test_make_llm_defaults_to_local_openai_compatible():
     assert client._base_url == DEFAULT_BASE_URL
     assert client._model == DEFAULT_MODEL
     assert client._api_key is None
+    assert client._timeout == 120.0
+
+
+def test_llm_defaults_pin_gpt_oss_and_local_lm_studio():
+    assert DEFAULT_BASE_URL == "http://localhost:1234/v1"
+    assert DEFAULT_MODEL == "openai/gpt-oss-20b"
 
 
 def test_make_llm_unknown_provider_raises_value_error(monkeypatch: pytest.MonkeyPatch):

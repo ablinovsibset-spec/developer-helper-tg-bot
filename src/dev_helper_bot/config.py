@@ -6,7 +6,7 @@ from dev_helper_bot.llm import LLMClient, LLMUnavailable
 from dev_helper_bot.llm.openai_compat import OpenAICompatibleClient
 
 DEFAULT_BASE_URL = "http://localhost:1234/v1"
-DEFAULT_MODEL = "Llama-3.2-3B-Instruct-4bit"
+DEFAULT_MODEL = "openai/gpt-oss-20b"
 DEFAULT_PROVIDER = "openai_compatible"
 
 
