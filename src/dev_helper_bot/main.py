@@ -14,6 +14,7 @@ from dotenv import load_dotenv
 from dev_helper_bot.agent import run_agent
 from dev_helper_bot.config import make_llm, telegram_token
 from dev_helper_bot.llm import LLMClient, LLMUnavailable, Message
+from dev_helper_bot.sandbox import SandboxExecutor, prepare_sandbox_environment
 from dev_helper_bot.skills import build_system_prompt, default_skills_dir, load_skills
 from dev_helper_bot.tools import EXEC_TOOL_SPEC
 
@@ -55,6 +56,7 @@ async def handle_text(
     llm: LLMClient,
     histories: ChatHistories,
     skills: dict[str, str],
+    make_executor: type[SandboxExecutor] = SandboxExecutor,
 ) -> None:
     system_prompt = build_system_prompt(skills, datetime.now())
     history = chat_history(histories, message.chat.id, system_prompt)
@@ -62,7 +64,9 @@ async def handle_text(
 
     await bot.send_message(chat_id=message.chat.id, text=WAITING_MESSAGE)
     try:
-        reply = await run_agent(llm, history, tools=[EXEC_TOOL_SPEC])
+        reply = await run_agent(
+            llm, history, tools=[EXEC_TOOL_SPEC], executor=make_executor()
+        )
     except LLMUnavailable as exc:
         log.warning("LLM unavailable: %s", exc)
         await bot.send_message(
@@ -92,10 +96,12 @@ async def main() -> None:
         token=token,
         default=DefaultBotProperties(parse_mode=ParseMode.HTML),
     )
+    await prepare_sandbox_environment()
     dp = Dispatcher()
     dp["llm"] = llm
     dp["histories"] = {}
     dp["skills"] = load_skills(default_skills_dir())
+    dp["make_executor"] = SandboxExecutor
     dp.message.register(handle_new, Command("new"))
     dp.message.register(handle_text, F.text)
 

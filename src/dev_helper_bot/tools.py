@@ -1,9 +1,7 @@
 from __future__ import annotations
 
-import asyncio
-import os
-import signal
-from typing import Any
+from dataclasses import dataclass
+from typing import Any, Protocol
 
 EXEC_TOOL_NAME = "exec"
 EXEC_TIMEOUT_SECONDS = 30.0
@@ -16,8 +14,9 @@ EXEC_TOOL_SPEC: dict[str, Any] = {
     "function": {
         "name": EXEC_TOOL_NAME,
         "description": (
-            "Выполнить консольную команду в shell системы и вернуть "
-            "stdout, stderr и код выхода. Поддерживаются пайпы и &&."
+            "Выполнить консольную команду в изолированном Linux-контейнере (Alpine) "
+            "и вернуть stdout, stderr и код выхода. Поддерживаются пайпы и &&. "
+            "Файлы и установленные пакеты живут до конца обработки текущего сообщения."
         ),
         "parameters": {
             "type": "object",
@@ -31,6 +30,32 @@ EXEC_TOOL_SPEC: dict[str, Any] = {
         },
     },
 }
+
+
+@dataclass(frozen=True)
+class ExecResult:
+    """Сырой результат команды: контракт между исполнителем и форматированием."""
+
+    exit_code: int
+    stdout: str
+    stderr: str
+    timed_out: bool = False
+
+
+class CommandExecutor(Protocol):
+    """Шов исполнителя команд: жизненный цикл песочницы + выполнение команды.
+
+    Продакшн-реализация — Docker-песочница (sandbox.SandboxExecutor);
+    в unit-тестах инъектируется двойник.
+    """
+
+    async def start(self) -> None: ...
+
+    async def execute(
+        self, command: str, timeout: float = EXEC_TIMEOUT_SECONDS
+    ) -> ExecResult: ...
+
+    async def stop(self) -> None: ...
 
 
 def truncate_output(text: str) -> str:
@@ -59,52 +84,26 @@ def format_result(
     return "\n".join(parts)
 
 
-def _kill_process_group(process: asyncio.subprocess.Process) -> None:
-    """Принудительно завершает процесс и его группу (защита от зомби)."""
-    try:
-        os.killpg(process.pid, signal.SIGKILL)
-    except (ProcessLookupError, PermissionError, OSError):
-        process.kill()
-
-
-async def exec_command(command: str, timeout: float = EXEC_TIMEOUT_SECONDS) -> str:
-    """Выполняет команду в shell и возвращает текст-результат для модели.
+async def exec_command(
+    executor: CommandExecutor,
+    command: str,
+    timeout: float = EXEC_TIMEOUT_SECONDS,
+) -> str:
+    """Выполняет команду через исполнитель и возвращает текст для модели.
 
     Ошибки выполнения не возбуждаются исключением — модель получает
     их описание как результат вызова инструмента.
     """
     try:
-        process = await asyncio.create_subprocess_shell(
-            command,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            start_new_session=True,
-        )
+        result = await executor.execute(command, timeout)
     except Exception as exc:
-        return f"Не удалось запустить процесс: {exc}"
-
-    timed_out = False
-    stdout_bytes = b""
-    stderr_bytes = b""
-    exit_code = -1
-    try:
-        stdout_bytes, stderr_bytes = await asyncio.wait_for(
-            process.communicate(), timeout=timeout
-        )
-        exit_code = process.returncode if process.returncode is not None else -1
-    except asyncio.TimeoutError:
-        timed_out = True
-        _kill_process_group(process)
-        await process.wait()
-
-    stdout = stdout_bytes.decode(errors="replace")
-    stderr = stderr_bytes.decode(errors="replace")
+        return f"Не удалось выполнить команду: {exc}"
     return truncate_output(
         format_result(
-            exit_code=exit_code,
-            stdout=stdout,
-            stderr=stderr,
-            timed_out=timed_out,
+            exit_code=result.exit_code,
+            stdout=result.stdout,
+            stderr=result.stderr,
+            timed_out=result.timed_out,
             timeout=timeout,
         )
     )

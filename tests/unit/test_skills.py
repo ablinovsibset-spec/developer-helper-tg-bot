@@ -5,6 +5,7 @@ from pathlib import Path
 
 from dev_helper_bot.skills import (
     REASONING_EFFORT_LINE,
+    SANDBOX_ENV_LINE,
     WEEKDAYS,
     build_system_prompt,
     datetime_line,
@@ -78,15 +79,17 @@ def test_build_system_prompt_contains_reasoning_datetime_and_sections(tmp_path):
     assert prompt.startswith(
         f"{REASONING_EFFORT_LINE}\nТекущие дата и время: 2026-08-28 07:45 (пятница)"
     )
+    assert SANDBOX_ENV_LINE in prompt
     assert "## wttr-in-api\nПравила wttr.in" in prompt
     assert "## morning\nУтро: погода Минск" in prompt
 
 
-def test_build_system_prompt_without_skills_is_reasoning_and_datetime():
+def test_build_system_prompt_without_skills_is_reasoning_datetime_and_env():
     prompt = build_system_prompt({}, datetime(2026, 8, 28, 7, 45))
 
     assert prompt == (
         "Reasoning: medium\nТекущие дата и время: 2026-08-28 07:45 (пятница)"
+        f"\n{SANDBOX_ENV_LINE}"
     )
 
 

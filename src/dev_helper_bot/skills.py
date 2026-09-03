@@ -6,6 +6,14 @@ from pathlib import Path
 REASONING_EFFORT_LINE = "Reasoning: medium"
 SKILLS_DIR_NAME = "skills"
 
+SANDBOX_ENV_LINE = (
+    "Окружение: команды инструмента exec выполняются в изолированном "
+    "Linux-контейнере (Alpine), без доступа к файловой системе хоста; "
+    "созданные файлы и установленные пакеты живут до конца обработки "
+    "текущего сообщения; cd и переменные окружения между вызовами "
+    "не сохраняются."
+)
+
 WEEKDAYS = (
     "понедельник",
     "вторник",
@@ -44,7 +52,9 @@ def build_system_prompt(skills: dict[str, str], now: datetime | None = None) -> 
     """Склейка системного промпта: reasoning, дата/время, секции скиллов."""
     if now is None:
         now = datetime.now()
-    sections = [f"{REASONING_EFFORT_LINE}\n{datetime_line(now)}"]
+    sections = [
+        f"{REASONING_EFFORT_LINE}\n{datetime_line(now)}\n{SANDBOX_ENV_LINE}"
+    ]
     for name, content in skills.items():
         sections.append(f"## {name}\n{content}")
     return "\n\n".join(sections)

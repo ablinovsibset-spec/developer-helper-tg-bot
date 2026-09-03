@@ -15,9 +15,17 @@ from dev_helper_bot.main import (
     handle_text,
     send_chunked,
 )
+from dev_helper_bot.skills import SANDBOX_ENV_LINE
 from dev_helper_bot.tools import EXEC_TOOL_SPEC
 
-from tests.conftest import FakeMessage, assistant_turn, make_llm_stub, make_scripted_llm, tool_call
+from tests.conftest import (
+    FakeCommandExecutor,
+    FakeMessage,
+    assistant_turn,
+    make_llm_stub,
+    make_scripted_llm,
+    tool_call,
+)
 
 CHAT_ID = 42
 SKILLS = {"wttr-in-api": "Правила wttr.in"}
@@ -25,10 +33,12 @@ T1 = datetime(2026, 8, 28, 7, 45)
 T2 = datetime(2026, 8, 28, 7, 47)
 SYSTEM_AT_T1 = (
     "Reasoning: medium\nТекущие дата и время: 2026-08-28 07:45 (пятница)"
+    f"\n{SANDBOX_ENV_LINE}"
     "\n\n## wttr-in-api\nПравила wttr.in"
 )
 SYSTEM_AT_T2 = (
     "Reasoning: medium\nТекущие дата и время: 2026-08-28 07:47 (пятница)"
+    f"\n{SANDBOX_ENV_LINE}"
     "\n\n## wttr-in-api\nПравила wttr.in"
 )
 
@@ -46,9 +56,17 @@ def fake_datetime(*times: datetime):
     return FakeDatetime
 
 
-async def handle(message, fake_bot, llm, histories=None, skills=SKILLS):
+async def handle(
+    message,
+    fake_bot,
+    llm,
+    histories=None,
+    skills=SKILLS,
+    make_executor=None,
+):
     histories = histories if histories is not None else {}
-    await handle_text(message, fake_bot, llm, histories, skills)
+    make_executor = make_executor or (lambda: FakeCommandExecutor())
+    await handle_text(message, fake_bot, llm, histories, skills, make_executor)
     return histories
 
 
@@ -220,3 +238,57 @@ async def test_send_chunked_boundary_lengths_fit_one_message(fake_bot, length):
     await send_chunked(fake_bot, CHAT_ID, text)
 
     assert len(fake_bot.sent) == 1
+
+
+async def test_each_message_gets_fresh_executor_and_state_does_not_survive(
+    fake_bot,
+):
+    created: list[FakeCommandExecutor] = []
+
+    def make_executor() -> FakeCommandExecutor:
+        executor = FakeCommandExecutor()
+        created.append(executor)
+        return executor
+
+    llm = make_scripted_llm(
+        [
+            assistant_turn(
+                content=None,
+                tool_calls=[tool_call(arguments='{"command": "echo data > note"}')],
+                finish_reason="tool_calls",
+            ),
+            assistant_turn(content="сохранил"),
+        ]
+    )
+    histories = await handle(
+        FakeMessage("первое", chat_id=CHAT_ID),
+        fake_bot,
+        llm,
+        make_executor=make_executor,
+    )
+
+    assert len(created) == 1
+    assert created[0].files == {"note": "data"}
+    assert created[0].stop_calls == 1  # песочница удалена после цикла
+
+    llm.turns = [
+        assistant_turn(
+            content=None,
+            tool_calls=[tool_call(arguments='{"command": "cat note"}')],
+            finish_reason="tool_calls",
+        ),
+        assistant_turn(content="файла нет"),
+    ]
+    await handle(
+        FakeMessage("второе", chat_id=CHAT_ID),
+        fake_bot,
+        llm,
+        histories=histories,
+        make_executor=make_executor,
+    )
+
+    assert len(created) == 2  # новая песочница на новое сообщение
+    assert created[1].files == {}  # чистое состояние: файл не пережил сообщение
+    tool_msg = llm.requests[3][7]  # второй вызов LLM второго сообщения: tool-сообщение
+    assert tool_msg["role"] == "tool"
+    assert "No such file" in tool_msg["content"]
