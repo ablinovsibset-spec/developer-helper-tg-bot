@@ -3,9 +3,13 @@ from __future__ import annotations
 import pytest
 
 from dev_helper_bot.agent import (
+    JSON_RETRIES_EXHAUSTED_MESSAGE,
     MAX_LLM_STEPS,
+    RESPONSE_TRUNCATED_MESSAGE,
     STEPS_EXHAUSTED_MESSAGE,
     run_agent,
+    validate_final,
+    validate_tool_call,
 )
 from dev_helper_bot.llm import LLMUnavailable, Message
 from dev_helper_bot.tools import EXEC_TOOL_SPEC
@@ -30,6 +34,56 @@ def echo_turn(command: str) -> dict:
         tool_calls=[tool_call(arguments='{"command": "%s"}' % command)],
         finish_reason="tool_calls",
     )
+
+
+def test_validate_tool_call_correct_json_returns_none():
+    assert (
+        validate_tool_call(
+            tool_call(arguments='{"command": "echo hi"}'), EXEC_TOOL_SPEC
+        )
+        is None
+    )
+
+
+def test_validate_tool_call_broken_json_error_contains_parse_details():
+    error = validate_tool_call(tool_call(arguments="не json"), EXEC_TOOL_SPEC)
+
+    assert error is not None
+    assert "Ошибка разбора arguments" in error
+    assert "Expecting" in error  # конкретная ошибка разбора
+    assert '"command"' in error  # ожидаемая форма
+
+
+def test_validate_tool_call_missing_required_param():
+    error = validate_tool_call(
+        tool_call(arguments='{"cmd": "echo hi"}'), EXEC_TOOL_SPEC
+    )
+
+    assert error is not None
+    assert "отсутствует" in error
+    assert '"command"' in error
+
+
+def test_validate_tool_call_non_string_param():
+    error = validate_tool_call(
+        tool_call(arguments='{"command": 5}'), EXEC_TOOL_SPEC
+    )
+
+    assert error is not None
+    assert '"command"' in error
+    assert "должен быть строкой" in error
+
+
+def test_validate_tool_call_non_object_json():
+    error = validate_tool_call(tool_call(arguments="[1, 2]"), EXEC_TOOL_SPEC)
+
+    assert error is not None
+    assert "JSON-объектом" in error
+
+
+def test_validate_final_is_always_valid_for_now():
+    assert validate_final("любой текст") is None
+    assert validate_final("") is None
 
 
 async def test_tool_call_then_final_returns_final_text():
@@ -211,3 +265,91 @@ async def test_file_created_on_one_step_is_visible_on_next_step():
     tool_msg = llm.requests[2][4]
     assert tool_msg["role"] == "tool"
     assert "data" in tool_msg["content"]
+
+
+def broken_json_turn(finish_reason: str = "tool_calls") -> dict:
+    return assistant_turn(
+        content=None,
+        tool_calls=[tool_call(arguments='{"command": "echo')],
+        finish_reason=finish_reason,
+    )
+
+
+async def test_three_consecutive_validation_failures_return_distinct_terminal():
+    llm = make_scripted_llm([broken_json_turn()])
+    executor = FakeCommandExecutor()
+
+    reply = await run_agent(llm, new_history(), tools=TOOLS, executor=executor)
+
+    assert reply == JSON_RETRIES_EXHAUSTED_MESSAGE
+    assert reply != STEPS_EXHAUSTED_MESSAGE
+    assert len(llm.requests) == 3
+    assert executor.commands == []
+
+
+async def test_success_between_failures_resets_counter():
+    llm = make_scripted_llm(
+        [
+            broken_json_turn(),
+            echo_turn("echo hi"),
+            broken_json_turn(),
+            broken_json_turn(),
+            assistant_turn(content="готово"),
+        ]
+    )
+    executor = FakeCommandExecutor()
+
+    reply = await run_agent(llm, new_history(), tools=TOOLS, executor=executor)
+
+    assert reply == "готово"
+    assert len(llm.requests) == 5
+    assert executor.commands == ["echo hi"]
+
+
+async def test_truncated_invalid_response_is_terminal_without_retries():
+    llm = make_scripted_llm([broken_json_turn(finish_reason="length")])
+    executor = FakeCommandExecutor()
+
+    reply = await run_agent(llm, new_history(), tools=TOOLS, executor=executor)
+
+    assert reply == RESPONSE_TRUNCATED_MESSAGE
+    assert len(llm.requests) == 1
+    assert executor.commands == []
+
+
+async def test_valid_tool_call_with_length_finish_reason_is_accepted():
+    llm = make_scripted_llm(
+        [
+            assistant_turn(
+                content=None,
+                tool_calls=[tool_call(arguments='{"command": "echo hi"}')],
+                finish_reason="length",
+            ),
+            assistant_turn(content="готово"),
+        ]
+    )
+    executor = FakeCommandExecutor()
+
+    reply = await run_agent(llm, new_history(), tools=TOOLS, executor=executor)
+
+    assert reply == "готово"
+    assert executor.commands == ["echo hi"]
+
+
+async def test_failed_turn_stays_in_history_with_specific_error_feedback():
+    llm = make_scripted_llm(
+        [broken_json_turn(), assistant_turn(content="исправился")]
+    )
+
+    await run_agent(
+        llm, new_history(), tools=TOOLS, executor=FakeCommandExecutor()
+    )
+
+    second_request = llm.requests[1]
+    broken_reply = second_request[1]
+    assert broken_reply["role"] == "assistant"
+    assert broken_reply["tool_calls"][0]["arguments"] == '{"command": "echo'
+    feedback = second_request[2]
+    assert feedback["role"] == "tool"
+    assert feedback["tool_call_id"] == "call_1"
+    assert "Ошибка разбора arguments" in feedback["content"]

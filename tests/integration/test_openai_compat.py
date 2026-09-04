@@ -7,7 +7,7 @@ import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestServer
 
-from dev_helper_bot.llm import AssistantTurn, LLMUnavailable, Message
+from dev_helper_bot.llm import AssistantTurn, LLMUnavailable, Message, ResponseFormat
 from dev_helper_bot.llm.openai_compat import (
     DEFAULT_TIMEOUT_SECONDS,
     OpenAICompatibleClient,
@@ -16,6 +16,18 @@ from dev_helper_bot.tools import EXEC_TOOL_SPEC
 
 MODEL = "test-model"
 MESSAGES: list[Message] = [{"role": "user", "content": "привет"}]
+
+RESPONSE_FORMAT: ResponseFormat = {
+    "type": "json_schema",
+    "json_schema": {
+        "name": "reply",
+        "schema": {
+            "type": "object",
+            "properties": {"answer": {"type": "string"}},
+            "required": ["answer"],
+        },
+    },
+}
 
 
 class FakeLLMServer:
@@ -37,6 +49,7 @@ class FakeLLMServer:
             ]
         }
         self.delay = 0.0
+        self.reject_response_format = False
 
     async def handle(self, request: web.Request) -> web.Response:
         self.requests.append(
@@ -46,6 +59,8 @@ class FakeLLMServer:
             await asyncio.sleep(self.delay)
         if self.status >= 400:
             return web.Response(status=self.status, text="server error")
+        if self.reject_response_format and "response_format" in self.requests[-1]["json"]:
+            return web.Response(status=400, text="response_format is not supported")
         return web.json_response(self.payload)
 
 
@@ -208,3 +223,57 @@ async def test_tool_calls_round_trip(fake_llm_server):
         "tool_call_id": "call_1",
         "content": "exit_code: 0\nstdout:\nhi",
     }
+
+
+async def test_response_format_is_sent_in_payload(fake_llm_server):
+    client = make_client(fake_llm_server.base_url)
+
+    turn = await client.complete(MESSAGES, response_format=RESPONSE_FORMAT)
+
+    assert turn["content"] == "тест-ответ"
+    assert len(fake_llm_server.requests) == 1
+    assert fake_llm_server.requests[0]["json"]["response_format"] == RESPONSE_FORMAT
+
+
+async def test_no_response_format_leaves_payload_unchanged(fake_llm_server):
+    client = make_client(fake_llm_server.base_url)
+
+    await client.complete(MESSAGES, response_format=None)
+
+    request = fake_llm_server.requests[0]
+    assert request["json"] == {"model": MODEL, "messages": MESSAGES}
+    assert "response_format" not in request["json"]
+
+
+async def test_http_400_with_response_format_retries_without_field_and_caches(
+    fake_llm_server,
+):
+    """Деградация: 400 → повтор без поля; кэш живёт до конца процесса клиента."""
+    fake_llm_server.reject_response_format = True
+    client = make_client(fake_llm_server.base_url)
+
+    turn = await client.complete(MESSAGES, response_format=RESPONSE_FORMAT)
+
+    assert turn["content"] == "тест-ответ"
+    assert len(fake_llm_server.requests) == 2
+    first, second = (r["json"] for r in fake_llm_server.requests)
+    assert first["response_format"] == RESPONSE_FORMAT
+    assert "response_format" not in second
+    assert second == {"model": MODEL, "messages": MESSAGES}
+
+    # Кэш: повторный вызов с response_format не кладёт поле в payload.
+    await client.complete(MESSAGES, response_format=RESPONSE_FORMAT)
+
+    assert len(fake_llm_server.requests) == 3
+    assert "response_format" not in fake_llm_server.requests[2]["json"]
+
+
+async def test_http_400_without_response_format_raises(fake_llm_server):
+    """400 без response_format в запросе — настоящая ошибка, без повтора."""
+    fake_llm_server.status = 400
+    client = make_client(fake_llm_server.base_url)
+
+    with pytest.raises(LLMUnavailable, match="HTTP 400"):
+        await client.complete(MESSAGES)
+
+    assert len(fake_llm_server.requests) == 1

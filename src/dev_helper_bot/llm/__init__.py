@@ -3,6 +3,7 @@ from .base import (
     LLMClient,
     LLMUnavailable,
     Message,
+    ResponseFormat,
     ToolCall,
     ToolSpec,
 )
@@ -14,6 +15,7 @@ __all__ = [
     "LLMUnavailable",
     "Message",
     "OpenAICompatibleClient",
+    "ResponseFormat",
     "ToolCall",
     "ToolSpec",
 ]

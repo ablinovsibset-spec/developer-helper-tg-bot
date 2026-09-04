@@ -6,7 +6,13 @@ from typing import Any
 
 import pytest
 
-from dev_helper_bot.llm import AssistantTurn, Message, ToolCall, ToolSpec
+from dev_helper_bot.llm import (
+    AssistantTurn,
+    Message,
+    ResponseFormat,
+    ToolCall,
+    ToolSpec,
+)
 from dev_helper_bot.tools import EXEC_TIMEOUT_SECONDS, ExecResult
 
 
@@ -54,14 +60,17 @@ class FakeLLM:
         self.error = error
         self.requests: list[list[Message]] = []
         self.tools_per_request: list[ToolSpec | None] = []
+        self.formats_per_request: list[ResponseFormat | None] = []
 
     async def complete(
         self,
         messages: list[Message],
         tools: list[ToolSpec] | None = None,
+        response_format: ResponseFormat | None = None,
     ) -> AssistantTurn:
         self.requests.append(list(messages))
         self.tools_per_request.append(tools)
+        self.formats_per_request.append(response_format)
         if self.error is not None:
             raise self.error
         if len(self.turns) > 1:
