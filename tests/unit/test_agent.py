@@ -12,7 +12,6 @@ from dev_helper_bot.tools import EXEC_TOOL_SPEC
 
 from tests.conftest import (
     FakeCommandExecutor,
-    FakeLLM,
     assistant_turn,
     make_scripted_llm,
     tool_call,
@@ -164,42 +163,27 @@ async def test_nonzero_exit_is_returned_to_model_not_raised():
     assert "exit_code: 7" in tool_msg["content"]
 
 
-async def test_run_agent_starts_executor_before_first_step():
-    starts_seen: list[int] = []
-
-    class ProbeLLM(FakeLLM):
-        async def complete(self, messages, tools=None):
-            starts_seen.append(executor.start_calls)
-            return await super().complete(messages, tools)
-
-    executor = FakeCommandExecutor()
-    llm = ProbeLLM(turns=[assistant_turn(content="без инструментов")])
-
-    await run_agent(llm, new_history(), tools=TOOLS, executor=executor)
-
-    assert starts_seen == [1]
-
-
-async def test_run_agent_stops_executor_after_final_reply():
+async def test_run_agent_does_not_stop_executor_after_final_reply():
+    """Lifecycle жителя принадлежит main: цикл его не останавливает."""
     llm = make_scripted_llm([assistant_turn(content="готово")])
     executor = FakeCommandExecutor()
 
     await run_agent(llm, new_history(), tools=TOOLS, executor=executor)
 
-    assert executor.stop_calls == 1
+    assert executor.stop_calls == 0
 
 
-async def test_run_agent_stops_executor_after_steps_exhausted():
+async def test_run_agent_does_not_stop_executor_after_steps_exhausted():
     llm = make_scripted_llm([echo_turn("echo again")])
     executor = FakeCommandExecutor()
 
     reply = await run_agent(llm, new_history(), tools=TOOLS, executor=executor)
 
     assert reply == STEPS_EXHAUSTED_MESSAGE
-    assert executor.stop_calls == 1
+    assert executor.stop_calls == 0
 
 
-async def test_run_agent_stops_executor_on_llm_error():
+async def test_run_agent_does_not_stop_executor_on_llm_error():
     llm = make_scripted_llm([])
     llm.error = LLMUnavailable("connection refused")
     executor = FakeCommandExecutor()
@@ -207,7 +191,7 @@ async def test_run_agent_stops_executor_on_llm_error():
     with pytest.raises(LLMUnavailable):
         await run_agent(llm, new_history(), tools=TOOLS, executor=executor)
 
-    assert executor.stop_calls == 1
+    assert executor.stop_calls == 0
 
 
 async def test_file_created_on_one_step_is_visible_on_next_step():

@@ -92,9 +92,10 @@ def tool_call(
 class FakeCommandExecutor:
     """Двойник CommandExecutor: жизнь без Docker и сети.
 
-    Симулирует файловое состояние песочницы для команд вида
-    `echo text > file` / `cat file`, а также `echo text` и `exit N`;
-    остальные команды возвращают scripted-результат (или default).
+    Симулирует файловое состояние долгоживущего контейнера-жителя для команд
+    вида `echo text > file` / `cat file` (состояние переживает вызовы),
+    а также `echo text` и `exit N`; остальные команды возвращают
+    scripted-результат (или default).
     """
 
     def __init__(
@@ -108,11 +109,7 @@ class FakeCommandExecutor:
         self.default = default or ExecResult(
             exit_code=0, stdout="", stderr="", timed_out=False
         )
-        self.start_calls = 0
         self.stop_calls = 0
-
-    async def start(self) -> None:
-        self.start_calls += 1
 
     async def stop(self) -> None:
         self.stop_calls += 1
@@ -148,8 +145,6 @@ class FakeCommandExecutor:
 
 class BrokenExecutor:
     """Двойник с падающей инфраструктурой: execute всегда бросает исключение."""
-
-    async def start(self) -> None: ...
 
     async def stop(self) -> None: ...
 

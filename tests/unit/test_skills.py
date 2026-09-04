@@ -107,3 +107,15 @@ def test_system_prompt_from_dir_end_to_end(tmp_path):
     assert "Текущие дата и время: 2026-08-28 07:45 (пятница)" in prompt
     assert "wttr-in-api" in prompt
     assert "morning" in prompt
+
+
+def test_sandbox_env_line_reflects_persistent_state():
+    """Промпт сообщает модели персистентность: файлы/пакеты переживают
+    сообщения и /new; сброс — только пересозданием контейнера."""
+    prompt = build_system_prompt({}, datetime(2026, 8, 28, 7, 45))
+
+    assert "переживают сообщения" in prompt
+    assert "/new" in prompt
+    assert "пересозданием контейнера" in prompt
+    # Прошлая формулировка «до конца сообщения» противоречит жителю.
+    assert "до конца обработки" not in prompt

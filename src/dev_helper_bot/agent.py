@@ -1,18 +1,14 @@
 from __future__ import annotations
 
 import json
-import logging
 from typing import Any
 
 from dev_helper_bot.llm import LLMClient, Message, ToolCall, ToolSpec
-from dev_helper_bot.sandbox import SandboxExecutor
 from dev_helper_bot.tools import (
     EXEC_TOOL_NAME,
     CommandExecutor,
     exec_command,
 )
-
-log = logging.getLogger("bot.agent")
 
 MAX_LLM_STEPS = 8
 
@@ -58,7 +54,8 @@ async def run_agent(
     llm: LLMClient,
     history: list[Message],
     tools: list[ToolSpec] | None = None,
-    executor: CommandExecutor | None = None,
+    *,
+    executor: CommandExecutor,
 ) -> str:
     """Агентный цикл: LLM → tool_calls → результаты в историю → повтор.
 
@@ -66,40 +63,30 @@ async def run_agent(
     tool-сообщения с результатами и финальный ответ ассистента.
     Reasoning в историю не попадает (отбрасывается на уровне контракта LLM).
 
-    Песочница создаётся перед первым шагом и принудительно удаляется
-    в `finally` независимо от исхода цикла (design D2).
+    Исполнитель команд передаётся готовым и переживает сообщения:
+    жизненным циклом песочницы владеет main (design D5) — контейнер-житель
+    создаётся при первом exec и удаляется при завершении процесса бота.
     """
-    if executor is None:
-        executor = SandboxExecutor()
-    try:
-        await executor.start()
-    except Exception as exc:
-        # Не роняем цикл: exec вернёт модели текст ошибки, startup-проверка
-        # уже гарантировала Docker при старте бота.
-        log.warning("Не удалось создать песочницу: %s", exc)
-    try:
-        for _ in range(MAX_LLM_STEPS):
-            turn = await llm.complete(history, tools)
-            if not turn["tool_calls"]:
-                reply = turn["content"] or ""
-                history.append({"role": "assistant", "content": reply})
-                return reply
+    for _ in range(MAX_LLM_STEPS):
+        turn = await llm.complete(history, tools)
+        if not turn["tool_calls"]:
+            reply = turn["content"] or ""
+            history.append({"role": "assistant", "content": reply})
+            return reply
+        history.append(
+            {
+                "role": "assistant",
+                "content": turn["content"],
+                "tool_calls": turn["tool_calls"],
+            }
+        )
+        for call in turn["tool_calls"]:
+            result = await execute_tool_call(call, executor)
             history.append(
                 {
-                    "role": "assistant",
-                    "content": turn["content"],
-                    "tool_calls": turn["tool_calls"],
+                    "role": "tool",
+                    "tool_call_id": call["id"],
+                    "content": result,
                 }
             )
-            for call in turn["tool_calls"]:
-                result = await execute_tool_call(call, executor)
-                history.append(
-                    {
-                        "role": "tool",
-                        "tool_call_id": call["id"],
-                        "content": result,
-                    }
-                )
-        return STEPS_EXHAUSTED_MESSAGE
-    finally:
-        await executor.stop()
+    return STEPS_EXHAUSTED_MESSAGE

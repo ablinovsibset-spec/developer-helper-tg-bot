@@ -62,11 +62,11 @@ async def handle(
     llm,
     histories=None,
     skills=SKILLS,
-    make_executor=None,
+    executor=None,
 ):
     histories = histories if histories is not None else {}
-    make_executor = make_executor or (lambda: FakeCommandExecutor())
-    await handle_text(message, fake_bot, llm, histories, skills, make_executor)
+    executor = executor if executor is not None else FakeCommandExecutor()
+    await handle_text(message, fake_bot, llm, histories, skills, executor)
     return histories
 
 
@@ -240,15 +240,10 @@ async def test_send_chunked_boundary_lengths_fit_one_message(fake_bot, length):
     assert len(fake_bot.sent) == 1
 
 
-async def test_each_message_gets_fresh_executor_and_state_does_not_survive(
-    fake_bot,
-):
-    created: list[FakeCommandExecutor] = []
-
-    def make_executor() -> FakeCommandExecutor:
-        executor = FakeCommandExecutor()
-        created.append(executor)
-        return executor
+async def test_same_executor_resident_state_survives_messages(fake_bot):
+    """Один executor на процесс бота: файл, созданный в первом сообщении,
+    читается следующим; между сообщениями stop не вызывается."""
+    executor = FakeCommandExecutor()
 
     llm = make_scripted_llm(
         [
@@ -264,12 +259,11 @@ async def test_each_message_gets_fresh_executor_and_state_does_not_survive(
         FakeMessage("первое", chat_id=CHAT_ID),
         fake_bot,
         llm,
-        make_executor=make_executor,
+        executor=executor,
     )
 
-    assert len(created) == 1
-    assert created[0].files == {"note": "data"}
-    assert created[0].stop_calls == 1  # песочница удалена после цикла
+    assert executor.files == {"note": "data"}
+    assert executor.stop_calls == 0  # житель не удаляется между сообщениями
 
     llm.turns = [
         assistant_turn(
@@ -277,18 +271,63 @@ async def test_each_message_gets_fresh_executor_and_state_does_not_survive(
             tool_calls=[tool_call(arguments='{"command": "cat note"}')],
             finish_reason="tool_calls",
         ),
-        assistant_turn(content="файла нет"),
+        assistant_turn(content="вот содержимое"),
     ]
     await handle(
         FakeMessage("второе", chat_id=CHAT_ID),
         fake_bot,
         llm,
         histories=histories,
-        make_executor=make_executor,
+        executor=executor,
     )
 
-    assert len(created) == 2  # новая песочница на новое сообщение
-    assert created[1].files == {}  # чистое состояние: файл не пережил сообщение
     tool_msg = llm.requests[3][7]  # второй вызов LLM второго сообщения: tool-сообщение
     assert tool_msg["role"] == "tool"
-    assert "No such file" in tool_msg["content"]
+    assert "data" in tool_msg["content"]  # состояние пережило сообщение
+    assert executor.stop_calls == 0
+
+
+async def test_main_creates_single_executor_and_stops_it_on_shutdown(
+    fake_bot, monkeypatch
+):
+    """main владеет lifecycle: один executor на процесс, stop() в finally
+    срабатывает и при ошибке polling, заодно закрывается session бота."""
+    import dev_helper_bot.main as main_module
+
+    executor = FakeCommandExecutor()
+    events: list[str] = []
+
+    class FakeSession:
+        async def close(self) -> None:
+            events.append("session_closed")
+
+    class FakeMainBot:
+        def __init__(self, token: str, default=None) -> None:
+            events.append("bot_created")
+            self.session = FakeSession()
+
+    class FakeDispatcher(main_module.Dispatcher):
+        async def start_polling(self, bot) -> None:
+            events.append("polling")
+            dp_executor = self["executor"]
+            assert dp_executor is executor
+            raise RuntimeError("polling stopped")
+
+    async def fake_prepare() -> None:
+        events.append("prepared")
+
+    monkeypatch.setattr(main_module, "load_dotenv", lambda: None)
+    monkeypatch.setattr(main_module, "telegram_token", lambda: "test-token")
+    monkeypatch.setattr(main_module, "make_llm", lambda: fake_bot)
+    monkeypatch.setattr(main_module, "prepare_sandbox_environment", fake_prepare)
+    monkeypatch.setattr(main_module, "SandboxExecutor", lambda: executor)
+    monkeypatch.setattr(main_module, "Bot", FakeMainBot)
+    monkeypatch.setattr(
+        main_module.Dispatcher, "start_polling", FakeDispatcher.start_polling
+    )
+
+    with pytest.raises(RuntimeError, match="polling stopped"):
+        await main_module.main()
+
+    assert events == ["bot_created", "prepared", "polling", "session_closed"]
+    assert executor.stop_calls == 1  # best-effort stop при завершении бота

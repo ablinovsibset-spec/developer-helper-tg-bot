@@ -1,9 +1,10 @@
 # Docker-интеграционные тесты песочницы (маркер `docker`, запуск: pytest -m docker).
 #
 # Проверяют реальные сценарии спецификации docker-sandbox против живого
-# Docker-демона: жизненный цикл контейнера на агентный цикл, файловое
-# состояние в пределах сообщения, таймаут внутри контейнера,
-# самовосстановление, sweep осиротевших песочниц и сборку образа.
+# Docker-демона: долгоживущий контейнер-жилец на процесс бота (персистентное
+# файловое состояние и пакеты между сообщениями и /new), удаление при
+# завершении бота, sweep осиротевших песочниц, таймаут внутри контейнера,
+# самовосстановление и сборку образа.
 from __future__ import annotations
 
 import asyncio
@@ -68,7 +69,6 @@ async def _container_exists(container_id: str | None) -> bool:
 async def test_exec_runs_as_unprivileged_user_in_workdir():
     executor = SandboxExecutor()
     try:
-        await executor.start()
         result = await executor.execute('echo "uid=$(id -u) home=$HOME pwd=$(pwd)"')
 
         assert result.exit_code == 0
@@ -79,34 +79,48 @@ async def test_exec_runs_as_unprivileged_user_in_workdir():
         await executor.stop()
 
 
-async def test_container_removed_after_agent_cycle():
-    llm = make_scripted_llm(
-        [_tool_turn("echo step"), assistant_turn(content="готово")]
+async def test_resident_not_removed_between_messages_removed_on_stop():
+    """4.3: контейнер-житель один на все сообщения, удаляется при завершении
+    бота (stop), а не после каждого агентного цикла."""
+    executor = SandboxExecutor()
+    first_llm = make_scripted_llm(
+        [_tool_turn("echo step-one"), assistant_turn(content="готово 1")]
     )
-    history = [{"role": "user", "content": "сделай"}]
-    seen: list[str | None] = []
+    try:
+        await _run_agent_with(
+            first_llm, [{"role": "user", "content": "первое"}], executor
+        )
+        first_id = executor.container_id
+        assert first_id is not None  # создан лениво при первом exec
 
-    class TrackingExecutor(SandboxExecutor):
-        async def execute(self, command, timeout=30.0):
-            seen.append(self.container_id)
-            return await super().execute(command, timeout)
+        second_llm = make_scripted_llm(
+            [_tool_turn("echo step-two"), assistant_turn(content="готово 2")]
+        )
+        await _run_agent_with(
+            second_llm, [{"role": "user", "content": "второе"}], executor
+        )
 
-    reply = await _run_agent_with(llm, history, TrackingExecutor())
+        assert executor.container_id == first_id  # тот же житель
+        assert await _container_exists(first_id) is True
+    finally:
+        await executor.stop()
 
-    assert reply == "готово"
-    assert seen and await _container_exists(seen[0]) is False
+    assert await _container_exists(first_id) is False  # убран при завершении
 
 
-async def test_container_removed_after_steps_exhausted():
+async def test_resident_not_removed_after_steps_exhausted():
     llm = make_scripted_llm([_tool_turn("echo again")])
     history = [{"role": "user", "content": "сделай"}]
     executor = SandboxExecutor()
 
-    reply = await _run_agent_with(llm, history, executor)
+    try:
+        reply = await _run_agent_with(llm, history, executor)
 
-    assert reply == STEPS_EXHAUSTED_MESSAGE
-    assert len(llm.requests) == MAX_LLM_STEPS
-    assert await _container_exists(executor.container_id) is False
+        assert reply == STEPS_EXHAUSTED_MESSAGE
+        assert len(llm.requests) == MAX_LLM_STEPS
+        assert await _container_exists(executor.container_id) is True
+    finally:
+        await executor.stop()
 
 
 async def test_file_survives_steps_within_one_message():
@@ -118,82 +132,133 @@ async def test_file_survives_steps_within_one_message():
         ]
     )
     history = [{"role": "user", "content": "сделай"}]
+    executor = SandboxExecutor()
 
-    reply = await _run_agent_with(llm, history, SandboxExecutor())
-
-    assert reply == "итог"
-    cat_result = llm.requests[2][4]["content"]
-    assert "payload" in cat_result
-    assert "exit_code: 0" in cat_result
-
-
-async def test_state_does_not_survive_between_messages():
-    first = SandboxExecutor()
     try:
-        await first.start()
-        await first.execute("echo payload > note")
-        first_id = first.container_id
+        reply = await _run_agent_with(llm, history, executor)
+
+        assert reply == "итог"
+        cat_result = llm.requests[2][4]["content"]
+        assert "payload" in cat_result
+        assert "exit_code: 0" in cat_result
     finally:
-        await first.stop()
+        await executor.stop()
 
-    assert await _container_exists(first_id) is False
 
-    second = SandboxExecutor()
+async def test_file_created_in_one_message_is_readable_in_next():
+    """4.1: файл переживает сообщения; /new (новая пустая история LLM)
+    не затрагивает файловое состояние жителя."""
+    executor = SandboxExecutor()
     try:
-        await second.start()
-        result = await second.execute("cat note")
-    finally:
-        await second.stop()
+        first_llm = make_scripted_llm(
+            [_tool_turn("echo payload > note"), assistant_turn(content="сохранил")]
+        )
+        await _run_agent_with(
+            first_llm, [{"role": "user", "content": "сохрани файл"}], executor
+        )
 
-    assert result.exit_code != 0
-    assert "No such file" in result.stderr
+        # «/new»: контекст LLM сброшен — новая история, тот же житель.
+        second_llm = make_scripted_llm(
+            [_tool_turn("cat note"), assistant_turn(content="прочитал")]
+        )
+        reply = await _run_agent_with(
+            second_llm, [{"role": "user", "content": "прочитай файл"}], executor
+        )
+
+        assert reply == "прочитал"
+        cat_result = second_llm.requests[1][2]["content"]
+        assert "payload" in cat_result
+        assert "exit_code: 0" in cat_result
+    finally:
+        await executor.stop()
+
+
+async def test_user_pip_package_survives_messages():
+    """4.2: пакет из `pip install --user` доступен в последующих сообщениях
+    без переустановки."""
+    executor = SandboxExecutor()
+    try:
+        install = await executor.execute(
+            "pip install --user six >/dev/null 2>&1 && echo installed"
+        )
+        assert install.exit_code == 0
+        assert "installed" in install.stdout
+
+        check = await executor.execute(
+            "python3 -c \"import six; print('six', six.__version__)\""
+        )
+
+        assert check.exit_code == 0
+        assert check.stdout.startswith("six ")
+    finally:
+        await executor.stop()
 
 
 async def test_timeout_inside_container_reports_timed_out():
     executor = SandboxExecutor()
     try:
-        await executor.start()
-
         result = await executor.execute("sleep 5", timeout=1.0)
 
         assert result.timed_out is True
         assert result.exit_code in (124, 143)
+        # Житель переживает таймаут команды: контейнер на месте.
+        assert await _container_exists(executor.container_id) is True
     finally:
         await executor.stop()
 
 
-async def test_self_heal_after_container_death():
+async def test_self_heal_after_resident_death_clean_state_and_retry():
+    """4.4: смерть жителя посреди работы — пересоздание с чистым состоянием,
+    повтор команды, бот не падает."""
     executor = SandboxExecutor()
     try:
-        await executor.start()
+        await executor.execute("echo payload > note")
+        old_id = executor.container_id
+        assert old_id is not None
 
-        # Внешнее убийство контейнера посреди «цикла».
-        await _docker_cli("rm", "-f", executor.container_id)
+        # Внешнее убийство жителя между сообщениями.
+        await _docker_cli("rm", "-f", old_id)
 
         result = await executor.execute("echo alive")
 
         assert result.exit_code == 0
-        assert "alive" in result.stdout
+        assert "alive" in result.stdout  # команда выполнена повторно
+
+        note = await executor.execute("cat note")
+
+        assert note.exit_code != 0  # состояние чистое: файла нет
+        assert "payload" not in note.stdout
+        assert executor.container_id != old_id
         assert await _container_exists(executor.container_id) is True
     finally:
         await executor.stop()
 
 
 async def test_sweep_removes_orphaned_labeled_containers():
-    orphan_id = await _docker_cli(
-        "run",
-        "-d",
-        "--label",
-        "dev-helper-bot.sandbox=true",
-        "alpine:3.20",
-        "sleep",
-        "infinity",
+    # Сирота после «аварийного завершения бота»: executor без stop().
+    crashed = SandboxExecutor()
+    await crashed.execute("echo orphan-marker")
+    orphan_ids = [crashed.container_id]
+    assert orphan_ids[0] is not None
+
+    # Отдельный посторонний контейнер с меткой бота.
+    orphan_ids.append(
+        await _docker_cli(
+            "run",
+            "-d",
+            "--label",
+            "dev-helper-bot.sandbox=true",
+            "alpine:3.20",
+            "sleep",
+            "infinity",
+        )
     )
 
     swept = await sweep_orphaned_sandboxes()
 
-    assert swept >= 1
-    assert await _container_exists(orphan_id) is False
+    assert swept >= 2
+    for orphan_id in orphan_ids:
+        assert await _container_exists(orphan_id) is False
 
 
 async def test_ensure_image_builds_missing_image():

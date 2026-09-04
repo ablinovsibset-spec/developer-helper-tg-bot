@@ -1,8 +1,11 @@
-"""Docker-песочница для исполнения команд агента (change add-docker-sandbox).
+"""Docker-песочница для исполнения команд агента (change add-docker-sandbox,
+migrate-agent-to-sbx).
 
-Единственный продакшн-исполнитель команд: контейнер на один агентный цикл
-(design D2), харднинг-флаги D5, busybox `timeout` внутри контейнера и
-async-страховка снаружи (D4), ленивое самовосстановление (D6), а также
+Единственный продакшн-исполнитель команд: один долгоживущий контейнер-жилец
+на процесс бота (design D1/D2, migrate-agent-to-sbx) — контейнер создаётся
+при первом exec после старта бота и живёт до его завершения; файлы и пакеты
+переживают сообщения. Харднинг-флаги D5, busybox `timeout` внутри контейнера
+и async-страховка снаружи (D4), ленивое самовосстановление (D6), а также
 startup-последовательность: `docker info` → sweep → ensure image (D7/D8).
 """
 from __future__ import annotations
@@ -106,12 +109,13 @@ def _is_daemon_error(stderr: str) -> bool:
 
 
 class SandboxExecutor:
-    """Исполнитель команд в Docker-контейнере на один агентный цикл.
+    """Исполнитель команд в долгоживущем Docker-контейнере-жильце.
 
-    `start()` создаёт и запускает контейнер с ограничениями; `execute()`
-    выполняет команду через `docker exec` (busybox `timeout` внутри,
+    Один исполнитель на процесс бота (владелец lifecycle — main, design D5):
+    контейнер создаётся лениво при первом `execute()` и не удаляется между
+    сообщениями; каждый вызов — `docker exec` (busybox `timeout` внутри,
     async-страховка снаружи, пересоздание при смерти контейнера);
-    `stop()` принудительно удаляет контейнер best-effort.
+    `stop()` принудительно удаляет контейнер best-effort при завершении бота.
     """
 
     def __init__(self, image: str = SANDBOX_IMAGE) -> None:
@@ -121,9 +125,6 @@ class SandboxExecutor:
     @property
     def container_id(self) -> str | None:
         return self._container_id
-
-    async def start(self) -> None:
-        await self._create_and_start()
 
     async def stop(self) -> None:
         container_id, self._container_id = self._container_id, None
@@ -208,9 +209,9 @@ class SandboxExecutor:
                 process.communicate(), timeout=timeout + CLI_GRACE_SECONDS
             )
         except asyncio.TimeoutError:
-            # Страховка от зависания docker CLI: внутренний `timeout` должен
-            # был сработать раньше; процесс внутри контейнера умрёт вместе
-            # с контейнером в конце цикла (design D4).
+            # Страховка от зависания docker CLI: внутренний busybox `timeout`
+            # — первичная защита и убивает команду SIGTERM'ом внутри жителя;
+            # здесь добиваем зависший клиентский процесс (design D4).
             _kill_process_group(process)
             await process.wait()
             return ExecResult(exit_code=-1, stdout="", stderr="", timed_out=True)
