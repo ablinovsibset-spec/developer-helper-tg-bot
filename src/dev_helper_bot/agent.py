@@ -6,7 +6,9 @@ from typing import Any
 from dev_helper_bot.llm import LLMClient, Message, ToolCall, ToolSpec
 from dev_helper_bot.tools import (
     EXEC_TOOL_NAME,
+    SEARCH_TOOL_NAME,
     CommandExecutor,
+    HistorySearcher,
     exec_command,
 )
 
@@ -107,18 +109,33 @@ def _validate_call(
 
 
 async def execute_tool_call(
-    call: ToolCall, executor: CommandExecutor
+    call: ToolCall,
+    executor: CommandExecutor,
+    history_search: HistorySearcher | None = None,
 ) -> str:
     """Исполняет валидированный вызов инструмента; ошибки возвращает как текст.
 
     Некорректные аргументы валидируются в агентном цикле до исполнителя
     (validate_tool_call); неизвестный инструмент — по-прежнему не исключение,
     а tool-сообщение с ошибкой: модель видит её и корректирует вызов.
+
+    `history_search` — шов поиска по прошлым беседам (search_history),
+    привязанный к текущему чату; исполнитель команд — только для exec.
     """
+    if call["name"] == SEARCH_TOOL_NAME:
+        if history_search is None:
+            return (
+                f"Ошибка: инструмент {SEARCH_TOOL_NAME!r} сейчас недоступен."
+            )
+        arguments = json.loads(call["arguments"] or "{}")
+        try:
+            return await history_search.search(arguments["query"])
+        except Exception as exc:
+            return f"Ошибка выполнения инструмента: {exc}"
     if call["name"] != EXEC_TOOL_NAME:
         return (
             f"Ошибка: неизвестный инструмент {call['name']!r}. "
-            f"Доступен только {EXEC_TOOL_NAME!r}."
+            f"Доступны {EXEC_TOOL_NAME!r} и {SEARCH_TOOL_NAME!r}."
         )
     arguments = json.loads(call["arguments"] or "{}")
     try:
@@ -133,6 +150,7 @@ async def run_agent(
     tools: list[ToolSpec] | None = None,
     *,
     executor: CommandExecutor,
+    history_search: HistorySearcher | None = None,
 ) -> str:
     """Агентный цикл: LLM → валидация хода → tool_calls → результаты в историю → повтор.
 
@@ -200,7 +218,7 @@ async def run_agent(
             result = (
                 error
                 if error is not None
-                else await execute_tool_call(call, executor)
+                else await execute_tool_call(call, executor, history_search)
             )
             history.append(
                 {

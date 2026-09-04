@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from typing import Any, Protocol
 
 EXEC_TOOL_NAME = "exec"
+SEARCH_TOOL_NAME = "search_history"
 EXEC_TIMEOUT_SECONDS = 30.0
 OUTPUT_LIMIT = 3000
 HEAD_CHARS = 1500
@@ -32,6 +33,32 @@ EXEC_TOOL_SPEC: dict[str, Any] = {
     },
 }
 
+SEARCH_TOOL_SPEC: dict[str, Any] = {
+    "type": "function",
+    "function": {
+        "name": SEARCH_TOOL_NAME,
+        "description": (
+            "Поиск по завершённым беседам текущего чата (прошлым сессиям). "
+            "Возвращает выдержки найденных сообщений с датой беседы и ролью "
+            "автора. Используй, когда пользователь спрашивает о том, что "
+            "обсуждалось раньше."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": (
+                        "Поисковый запрос: слово или фраза, которые могли "
+                        "встретиться в прошлой беседе"
+                    ),
+                },
+            },
+            "required": ["query"],
+        },
+    },
+}
+
 
 @dataclass(frozen=True)
 class ExecResult:
@@ -56,6 +83,17 @@ class CommandExecutor(Protocol):
     ) -> ExecResult: ...
 
     async def stop(self) -> None: ...
+
+
+class HistorySearcher(Protocol):
+    """Шов поиска по прошлым беседам: читающий поиск по завершённым
+    сессиям текущего чата.
+
+    Продакшн-реализация — memory.ChatHistorySearcher (обёртка MemoryStore,
+    привязанная к chat_id сообщения); в unit-тестах инъектируется двойник.
+    """
+
+    async def search(self, query: str) -> str: ...
 
 
 def truncate_output(text: str) -> str:

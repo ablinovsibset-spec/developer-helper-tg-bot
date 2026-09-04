@@ -4,8 +4,10 @@ import pytest
 
 from dev_helper_bot.config import (
     DEFAULT_BASE_URL,
+    DEFAULT_MEMORY_DB_PATH,
     DEFAULT_MODEL,
     make_llm,
+    memory_db_path,
     telegram_token,
 )
 from dev_helper_bot.llm.openai_compat import OpenAICompatibleClient
@@ -52,3 +54,18 @@ def test_telegram_token_present_is_returned(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "123:abc")
 
     assert telegram_token() == "123:abc"
+
+
+def test_memory_db_path_defaults_to_vm_local_disk(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.delenv("MEMORY_DB_PATH", raising=False)
+
+    assert memory_db_path() == DEFAULT_MEMORY_DB_PATH
+    # VM-локальный диск, не workspace-маунт (design D2)
+    assert not DEFAULT_MEMORY_DB_PATH.startswith(("/", "."))
+    assert DEFAULT_MEMORY_DB_PATH.startswith("~/")
+
+
+def test_memory_db_path_env_override_wins(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("MEMORY_DB_PATH", "/tmp/custom-memory.db")
+
+    assert memory_db_path() == "/tmp/custom-memory.db"

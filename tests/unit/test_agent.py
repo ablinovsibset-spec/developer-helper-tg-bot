@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import re
+
 import pytest
 
 from dev_helper_bot.agent import (
@@ -12,7 +14,13 @@ from dev_helper_bot.agent import (
     validate_tool_call,
 )
 from dev_helper_bot.llm import LLMUnavailable, Message
-from dev_helper_bot.tools import EXEC_TOOL_SPEC
+from dev_helper_bot.memory import (
+    SEARCH_EXCERPT_LIMIT,
+    SEARCH_NOT_FOUND_TEMPLATE,
+    ChatHistorySearcher,
+    MemoryStore,
+)
+from dev_helper_bot.tools import EXEC_TOOL_SPEC, SEARCH_TOOL_SPEC
 
 from tests.conftest import (
     FakeCommandExecutor,
@@ -21,7 +29,10 @@ from tests.conftest import (
     tool_call,
 )
 
-TOOLS = [EXEC_TOOL_SPEC]
+TOOLS = [EXEC_TOOL_SPEC, SEARCH_TOOL_SPEC]
+CHAT_ID = 42
+OTHER_CHAT_ID = 4242
+DATE_IN_BRACKETS = re.compile(r"\[\d{4}-\d{2}-\d{2}\]")
 
 
 def new_history() -> list[Message]:
@@ -353,3 +364,148 @@ async def test_failed_turn_stays_in_history_with_specific_error_feedback():
     assert feedback["role"] == "tool"
     assert feedback["tool_call_id"] == "call_1"
     assert "Ошибка разбора arguments" in feedback["content"]
+
+
+def search_turn(query: str) -> dict:
+    return assistant_turn(
+        content=None,
+        tool_calls=[tool_call(name="search_history", arguments=f'{{"query": "{query}"}}')],
+        finish_reason="tool_calls",
+    )
+
+
+def tool_result(llm, request_index: int = 1) -> str:
+    tool_msgs = [m for m in llm.requests[request_index] if m["role"] == "tool"]
+    assert tool_msgs, "tool-сообщение не найдено в запросе"
+    return tool_msgs[-1]["content"]
+
+
+@pytest.fixture
+async def store(tmp_path):
+    store = MemoryStore(tmp_path / "memory.db")
+    await store.open()
+    yield store
+    await store.close()
+
+
+async def run_search_agent(store, llm) -> str:
+    return await run_agent(
+        llm,
+        new_history(),
+        tools=TOOLS,
+        executor=FakeCommandExecutor(),
+        history_search=ChatHistorySearcher(store, CHAT_ID),
+    )
+
+
+async def test_search_history_returns_excerpts_from_completed_session(store):
+    await store.append_user(CHAT_ID, "обсудили деплой базы")
+    await store.append_assistant(CHAT_ID, "итог: используем sqlite")
+    await store.close_session(CHAT_ID)
+    llm = make_scripted_llm(
+        [search_turn("деплой"), assistant_turn(content="вот что было")]
+    )
+
+    reply = await run_search_agent(store, llm)
+
+    assert reply == "вот что было"
+    result = tool_result(llm)
+    assert "обсудили деплой базы" in result
+    assert "user" in result
+    assert DATE_IN_BRACKETS.search(result)
+
+
+async def test_search_history_not_found_returns_explicit_marker(store):
+    await store.append_user(CHAT_ID, "разговор о погоде")
+    await store.close_session(CHAT_ID)
+    llm = make_scripted_llm(
+        [search_turn("квантовая физика"), assistant_turn(content="не помню такого")]
+    )
+
+    await run_search_agent(store, llm)
+
+    assert tool_result(llm) == SEARCH_NOT_FOUND_TEMPLATE.format(
+        query="квантовая физика"
+    )
+
+
+async def test_search_history_volume_is_limited(store):
+    await store.append_user(CHAT_ID, "начало")
+    for i in range(SEARCH_EXCERPT_LIMIT + 2):
+        await store.append_user(CHAT_ID, f"запись маркер {i:02d}")
+    await store.close_session(CHAT_ID)
+    llm = make_scripted_llm(
+        [search_turn("маркер"), assistant_turn(content="нашёл выдержки")]
+    )
+
+    await run_search_agent(store, llm)
+
+    assert tool_result(llm).count("маркер") == SEARCH_EXCERPT_LIMIT
+
+
+async def test_search_history_isolates_chats(store):
+    await store.append_user(OTHER_CHAT_ID, "чужой секретный маркер")
+    await store.close_session(OTHER_CHAT_ID)
+    llm = make_scripted_llm(
+        [search_turn("маркер"), assistant_turn(content="пусто")]
+    )
+
+    await run_search_agent(store, llm)
+
+    assert tool_result(llm) == SEARCH_NOT_FOUND_TEMPLATE.format(query="маркер")
+
+
+async def test_search_history_skips_open_session(store):
+    await store.append_user(CHAT_ID, "открытая сессия про деплой")
+    llm = make_scripted_llm(
+        [search_turn("деплой"), assistant_turn(content="в текущем контексте")]
+    )
+
+    await run_search_agent(store, llm)
+
+    assert tool_result(llm) == SEARCH_NOT_FOUND_TEMPLATE.format(query="деплой")
+
+
+async def test_search_history_is_read_only(store):
+    await store.append_user(CHAT_ID, "запись про маркер")
+    await store.append_assistant(CHAT_ID, "итог сессии")
+    await store.close_session(CHAT_ID)
+    before = await store.load_open_history(CHAT_ID)
+    llm = make_scripted_llm(
+        [search_turn("маркер"), assistant_turn(content="нашёл")]
+    )
+
+    await run_search_agent(store, llm)
+
+    assert await store.load_open_history(CHAT_ID) == before == []
+
+
+async def test_search_history_without_searcher_reports_tool_error():
+    llm = make_scripted_llm(
+        [search_turn("что угодно"), assistant_turn(content="понял")]
+    )
+
+    reply = await run_agent(
+        llm, new_history(), tools=TOOLS, executor=FakeCommandExecutor()
+    )
+
+    assert reply == "понял"
+    assert "недоступен" in tool_result(llm)
+
+
+async def test_search_history_missing_query_validated_before_executor(store):
+    llm = make_scripted_llm(
+        [
+            assistant_turn(
+                content=None,
+                tool_calls=[tool_call(name="search_history", arguments="{}")],
+                finish_reason="tool_calls",
+            ),
+            assistant_turn(content="исправился"),
+        ]
+    )
+
+    reply = await run_search_agent(store, llm)
+
+    assert reply == "исправился"
+    assert '"query"' in tool_result(llm)
