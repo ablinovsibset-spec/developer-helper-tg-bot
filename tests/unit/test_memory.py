@@ -5,7 +5,10 @@ import re
 import pytest
 
 from dev_helper_bot.memory import (
+    LIST_SESSIONS_EMPTY_MARKER,
+    LIST_SESSIONS_LIMIT,
     OPEN_HISTORY_LIMIT,
+    PREVIEW_CHARS,
     SEARCH_EXCERPT_LIMIT,
     SEARCH_NOT_FOUND_TEMPLATE,
     MemoryStore,
@@ -200,3 +203,64 @@ async def test_search_completed_excerpt_is_windowed(store):
     excerpt = result.split(": ", 1)[1]
     assert len(excerpt) < len(content)
     assert "цитируемый фрагмент" in excerpt
+
+
+async def test_list_completed_sessions_shows_date_count_and_preview(store):
+    await store.append_user(CHAT_ID, "беседа про деплой базы")
+    await store.append_assistant(CHAT_ID, "итог: используем sqlite")
+    await store.close_session(CHAT_ID)
+
+    result = await store.list_completed_sessions(CHAT_ID)
+
+    assert "Завершённые беседы" in result
+    assert DATE_IN_BRACKETS.search(result)
+    assert "сообщений: 2" in result
+    assert "начало: беседа про деплой базы" in result
+    # Строго читающая операция: открытая сессия не создалась
+    assert await store.load_open_history(CHAT_ID) == []
+
+
+async def test_list_completed_sessions_skips_open_session(store):
+    await store.append_user(CHAT_ID, "завершённая тема")
+    await store.close_session(CHAT_ID)
+    await store.append_user(CHAT_ID, "тема открытой сессии")
+
+    result = await store.list_completed_sessions(CHAT_ID)
+
+    assert "завершённая тема" in result
+    assert "тема открытой сессии" not in result
+
+
+async def test_list_completed_sessions_limited_to_last_ten(store):
+    for i in range(LIST_SESSIONS_LIMIT + 5):
+        await store.append_user(CHAT_ID, f"тема номер {i:02d}")
+        await store.close_session(CHAT_ID)
+
+    result = await store.list_completed_sessions(CHAT_ID)
+
+    assert result.count("тема номер") == LIST_SESSIONS_LIMIT
+    assert "тема номер 04" not in result  # старые выпали из обзора
+    assert "тема номер 05" in result  # последние 10 остаются
+
+
+async def test_list_completed_sessions_preview_is_truncated(store):
+    long_text = "а" * (PREVIEW_CHARS + 50)
+    await store.append_user(CHAT_ID, long_text)
+    await store.close_session(CHAT_ID)
+
+    result = await store.list_completed_sessions(CHAT_ID)
+
+    assert long_text not in result
+    assert "а" * PREVIEW_CHARS in result
+    assert result.rstrip().endswith("…")
+
+
+async def test_list_completed_sessions_empty_returns_explicit_marker(store):
+    assert await store.list_completed_sessions(CHAT_ID) == LIST_SESSIONS_EMPTY_MARKER
+
+
+async def test_list_completed_sessions_isolates_chats(store):
+    await store.append_user(OTHER_CHAT_ID, "чужая завершённая тема")
+    await store.close_session(OTHER_CHAT_ID)
+
+    assert await store.list_completed_sessions(CHAT_ID) == LIST_SESSIONS_EMPTY_MARKER

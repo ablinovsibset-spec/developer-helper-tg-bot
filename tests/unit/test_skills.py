@@ -4,6 +4,7 @@ from datetime import datetime
 from pathlib import Path
 
 from dev_helper_bot.skills import (
+    MEMORY_ENV_LINE,
     REASONING_EFFORT_LINE,
     SANDBOX_ENV_LINE,
     WEEKDAYS,
@@ -90,7 +91,28 @@ def test_build_system_prompt_without_skills_is_reasoning_datetime_and_env():
     assert prompt == (
         "Reasoning: medium\nТекущие дата и время: 2026-08-28 07:45 (пятница)"
         f"\n{SANDBOX_ENV_LINE}"
+        f"\n{MEMORY_ENV_LINE}"
     )
+
+
+def test_memory_env_line_present_in_prompt_with_skills(tmp_path):
+    skills = load_skills(make_skills_dir(tmp_path))
+
+    prompt = build_system_prompt(skills, datetime(2026, 8, 28, 7, 45))
+
+    assert MEMORY_ENV_LINE in prompt
+
+
+def test_memory_env_line_present_in_prompt_with_empty_skills():
+    prompt = build_system_prompt({})
+
+    assert MEMORY_ENV_LINE in prompt
+
+
+def test_memory_env_line_goes_right_after_sandbox_env_line():
+    prompt = build_system_prompt({}, datetime(2026, 8, 28, 7, 45))
+
+    assert prompt.index(SANDBOX_ENV_LINE) < prompt.index(MEMORY_ENV_LINE)
 
 
 def test_build_system_prompt_default_now_does_not_crash():

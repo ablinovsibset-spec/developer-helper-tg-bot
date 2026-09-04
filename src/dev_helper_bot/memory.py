@@ -26,6 +26,11 @@ SEARCH_NOT_FOUND_TEMPLATE = (
     "в завершённых беседах этого чата."
 )
 
+LIST_SESSIONS_LIMIT = 10
+PREVIEW_CHARS = 120
+
+LIST_SESSIONS_EMPTY_MARKER = "Завершённых бесед в этом чате нет"
+
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS sessions (
     id INTEGER PRIMARY KEY,
@@ -53,6 +58,20 @@ _SEARCH_SQL = (
     "LIMIT ?"
 )
 
+_LIST_SESSIONS_SQL = (
+    "SELECT s.started_at, COUNT(m.id), fm.content "
+    "FROM sessions s "
+    "LEFT JOIN messages m ON m.session_id = s.id "
+    "LEFT JOIN messages fm ON fm.id = ("
+    "SELECT MIN(f.id) FROM messages f "
+    "WHERE f.session_id = s.id AND f.role = 'user'"
+    ") "
+    "WHERE s.chat_id = ? AND s.ended_at IS NOT NULL "
+    "GROUP BY s.id "
+    "ORDER BY s.started_at DESC, s.id DESC "
+    "LIMIT ?"
+)
+
 
 def _utcnow_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
@@ -75,6 +94,13 @@ def _excerpt(content: str, query: str, chars: int = SEARCH_EXCERPT_CHARS) -> str
     prefix = "…" if start > 0 else ""
     suffix = "…" if end < len(content) else ""
     return f"{prefix}{content[start:end]}{suffix}"
+
+
+def _preview(content: str, chars: int = PREVIEW_CHARS) -> str:
+    """Превью начала сообщения: до chars символов, длиннее — с маркером."""
+    if len(content) <= chars:
+        return content
+    return content[:chars] + "…"
 
 
 class MemoryStore:
@@ -182,12 +208,37 @@ class MemoryStore:
             lines.append(f"— [{started_at[:10]}] {role}: {_excerpt(content, query)}")
         return "\n".join(lines)
 
+    async def list_completed_sessions(self, chat_id: int) -> str:
+        """Обзор завершённых сессий чата (design D1/D5).
+
+        Последние LIST_SESSIONS_LIMIT сессий по времени начала, одним
+        SQL-запросом: дата начала, число сообщений и превью первого
+        user-сообщения. Открытая сессия не попадает; пустой результат —
+        явный маркер. Строго читающая операция.
+        """
+        cursor = await self._conn.execute(
+            _LIST_SESSIONS_SQL, (chat_id, LIST_SESSIONS_LIMIT)
+        )
+        rows = await cursor.fetchall()
+        if not rows:
+            return LIST_SESSIONS_EMPTY_MARKER
+        lines = [f"Завершённые беседы этого чата: {len(rows)}"]
+        for started_at, message_count, first_user in rows:
+            preview = (
+                _preview(first_user) if first_user else "(нет сообщений пользователя)"
+            )
+            lines.append(
+                f"— [{started_at[:10]}] сообщений: {message_count}; начало: {preview}"
+            )
+        return "\n".join(lines)
+
 
 class ChatHistorySearcher:
-    """Инструмент search_history для конкретного чата: обёртка MemoryStore.
+    """Инструменты доступа к прошлым беседам конкретного чата:
+    обёртка MemoryStore для search_history и list_sessions.
 
-    Реализует шов HistorySearcher (tools.py), привязывая поиск к chat_id
-    обрабатываемого сообщения.
+    Реализует шов HistorySearcher (tools.py), привязывая операции
+    к chat_id обрабатываемого сообщения.
     """
 
     def __init__(self, store: MemoryStore, chat_id: int) -> None:
@@ -196,3 +247,6 @@ class ChatHistorySearcher:
 
     async def search(self, query: str) -> str:
         return await self._store.search_completed(self._chat_id, query)
+
+    async def list_sessions(self) -> str:
+        return await self._store.list_completed_sessions(self._chat_id)

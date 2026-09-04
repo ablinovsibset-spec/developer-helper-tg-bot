@@ -17,13 +17,18 @@ from dev_helper_bot.llm import LLMClient, LLMUnavailable, Message
 from dev_helper_bot.memory import ChatHistorySearcher, MemoryStore
 from dev_helper_bot.sandbox import SandboxExecutor, prepare_sandbox_environment
 from dev_helper_bot.skills import build_system_prompt, default_skills_dir, load_skills
-from dev_helper_bot.tools import EXEC_TOOL_SPEC, SEARCH_TOOL_SPEC, CommandExecutor
+from dev_helper_bot.tools import (
+    EXEC_TOOL_SPEC,
+    LIST_TOOL_SPEC,
+    SEARCH_TOOL_SPEC,
+    CommandExecutor,
+)
 
 TELEGRAM_MESSAGE_LIMIT = 4096
 WAITING_MESSAGE = "⏳ Готовлю ответ…"
 NEW_CHAT_CONFIRMATION = "🆕 Контекст сброшен — начинаем новый диалог."
 
-AGENT_TOOLS = [EXEC_TOOL_SPEC, SEARCH_TOOL_SPEC]
+AGENT_TOOLS = [EXEC_TOOL_SPEC, SEARCH_TOOL_SPEC, LIST_TOOL_SPEC]
 
 logging.basicConfig(
     level=logging.INFO,

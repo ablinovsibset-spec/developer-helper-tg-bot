@@ -15,6 +15,16 @@ SANDBOX_ENV_LINE = (
     "cd и переменные окружения между вызовами не сохраняются."
 )
 
+MEMORY_ENV_LINE = (
+    "Память бесед: прошлые беседы этого чата хранятся и доступны через "
+    "инструменты: list_sessions — обзор завершённых бесед (дата начала, "
+    "число сообщений, превью), search_history — поиск по ключевому слову. "
+    "Если пользователь ссылается на прошлое («что мы обсуждали», "
+    "«помнишь, я спрашивал»), сначала вызови list_sessions, затем "
+    "search_history по ключевому слову из превью. Не отвечай «не помню», "
+    "не проверив эти инструменты."
+)
+
 WEEKDAYS = (
     "понедельник",
     "вторник",
@@ -54,7 +64,8 @@ def build_system_prompt(skills: dict[str, str], now: datetime | None = None) -> 
     if now is None:
         now = datetime.now()
     sections = [
-        f"{REASONING_EFFORT_LINE}\n{datetime_line(now)}\n{SANDBOX_ENV_LINE}"
+        f"{REASONING_EFFORT_LINE}\n{datetime_line(now)}"
+        f"\n{SANDBOX_ENV_LINE}\n{MEMORY_ENV_LINE}"
     ]
     for name, content in skills.items():
         sections.append(f"## {name}\n{content}")

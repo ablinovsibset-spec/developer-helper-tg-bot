@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import re
 
 import pytest
@@ -15,24 +16,31 @@ from dev_helper_bot.agent import (
 )
 from dev_helper_bot.llm import LLMUnavailable, Message
 from dev_helper_bot.memory import (
+    LIST_SESSIONS_EMPTY_MARKER,
     SEARCH_EXCERPT_LIMIT,
     SEARCH_NOT_FOUND_TEMPLATE,
     ChatHistorySearcher,
     MemoryStore,
 )
-from dev_helper_bot.tools import EXEC_TOOL_SPEC, SEARCH_TOOL_SPEC
+from dev_helper_bot.tools import EXEC_TOOL_SPEC, LIST_TOOL_SPEC, SEARCH_TOOL_SPEC
 
 from tests.conftest import (
+    BrokenHistorySearcher,
     FakeCommandExecutor,
     assistant_turn,
     make_scripted_llm,
     tool_call,
 )
 
-TOOLS = [EXEC_TOOL_SPEC, SEARCH_TOOL_SPEC]
+TOOLS = [EXEC_TOOL_SPEC, SEARCH_TOOL_SPEC, LIST_TOOL_SPEC]
 CHAT_ID = 42
 OTHER_CHAT_ID = 4242
 DATE_IN_BRACKETS = re.compile(r"\[\d{4}-\d{2}-\d{2}\]")
+AGENT_LOGGER_NAME = "dev_helper_bot.agent"
+
+
+def agent_log_records(caplog) -> list[logging.LogRecord]:
+    return [r for r in caplog.records if r.name == AGENT_LOGGER_NAME]
 
 
 def new_history() -> list[Message]:
@@ -374,6 +382,14 @@ def search_turn(query: str) -> dict:
     )
 
 
+def list_sessions_turn() -> dict:
+    return assistant_turn(
+        content=None,
+        tool_calls=[tool_call(name="list_sessions", arguments="{}")],
+        finish_reason="tool_calls",
+    )
+
+
 def tool_result(llm, request_index: int = 1) -> str:
     tool_msgs = [m for m in llm.requests[request_index] if m["role"] == "tool"]
     assert tool_msgs, "tool-сообщение не найдено в запросе"
@@ -509,3 +525,144 @@ async def test_search_history_missing_query_validated_before_executor(store):
 
     assert reply == "исправился"
     assert '"query"' in tool_result(llm)
+
+
+def test_validate_tool_call_list_sessions_accepts_empty_arguments():
+    assert (
+        validate_tool_call(
+            tool_call(name="list_sessions", arguments="{}"), LIST_TOOL_SPEC
+        )
+        is None
+    )
+    assert (
+        validate_tool_call(tool_call(name="list_sessions", arguments=""), LIST_TOOL_SPEC)
+        is None
+    )
+
+
+def test_validate_tool_call_list_sessions_broken_json_reports_error():
+    error = validate_tool_call(
+        tool_call(name="list_sessions", arguments="не json"), LIST_TOOL_SPEC
+    )
+
+    assert error is not None
+    assert "Ошибка разбора arguments" in error
+
+
+async def test_list_sessions_delegates_to_seam_and_returns_its_result(store):
+    await store.append_user(CHAT_ID, "беседа про деплой базы")
+    await store.append_assistant(CHAT_ID, "итог: используем sqlite")
+    await store.close_session(CHAT_ID)
+    llm = make_scripted_llm(
+        [list_sessions_turn(), assistant_turn(content="вот что было раньше")]
+    )
+
+    reply = await run_search_agent(store, llm)
+
+    assert reply == "вот что было раньше"
+    result = tool_result(llm)
+    assert "Завершённые беседы" in result
+    assert DATE_IN_BRACKETS.search(result)
+    assert "беседа про деплой базы" in result
+
+
+async def test_list_sessions_without_completed_sessions_returns_marker(store):
+    llm = make_scripted_llm(
+        [list_sessions_turn(), assistant_turn(content="прошлых бесед нет")]
+    )
+
+    await run_search_agent(store, llm)
+
+    assert tool_result(llm) == LIST_SESSIONS_EMPTY_MARKER
+
+
+async def test_list_sessions_without_searcher_reports_tool_error():
+    llm = make_scripted_llm(
+        [list_sessions_turn(), assistant_turn(content="понял")]
+    )
+
+    reply = await run_agent(
+        llm, new_history(), tools=TOOLS, executor=FakeCommandExecutor()
+    )
+
+    assert reply == "понял"
+    assert "недоступен" in tool_result(llm)
+
+
+async def test_list_sessions_execution_error_returned_as_tool_text():
+    llm = make_scripted_llm(
+        [list_sessions_turn(), assistant_turn(content="повторю позже")]
+    )
+
+    reply = await run_agent(
+        llm,
+        new_history(),
+        tools=TOOLS,
+        executor=FakeCommandExecutor(),
+        history_search=BrokenHistorySearcher(),
+    )
+
+    assert reply == "повторю позже"
+    assert "Ошибка выполнения инструмента" in tool_result(llm)
+
+
+async def test_successful_tool_call_is_logged_with_name_and_outcome(caplog):
+    caplog.set_level(logging.INFO, logger=AGENT_LOGGER_NAME)
+    llm = make_scripted_llm(
+        [echo_turn("echo hi"), assistant_turn(content="готово")]
+    )
+
+    await run_agent(llm, new_history(), tools=TOOLS, executor=FakeCommandExecutor())
+
+    records = agent_log_records(caplog)
+    assert len(records) == 1
+    assert records[0].levelname == "INFO"
+    assert "exec" in records[0].getMessage()
+    assert "success" in records[0].getMessage()
+    # Аргументы и содержимое результатов в журнал не попадают (design D4)
+    assert "echo hi" not in records[0].getMessage()
+
+
+async def test_execution_error_is_logged_with_tool_name(caplog):
+    caplog.set_level(logging.INFO, logger=AGENT_LOGGER_NAME)
+    llm = make_scripted_llm(
+        [search_turn("деплой"), assistant_turn(content="повторю позже")]
+    )
+
+    await run_agent(
+        llm,
+        new_history(),
+        tools=TOOLS,
+        executor=FakeCommandExecutor(),
+        history_search=BrokenHistorySearcher(),
+    )
+
+    records = agent_log_records(caplog)
+    assert len(records) == 1
+    assert records[0].levelname == "INFO"
+    message = records[0].getMessage()
+    assert "search_history" in message
+    assert "error" in message
+
+
+async def test_validation_rejected_call_is_logged_with_reason(caplog):
+    caplog.set_level(logging.INFO, logger=AGENT_LOGGER_NAME)
+    llm = make_scripted_llm([broken_json_turn(), assistant_turn(content="исправился")])
+
+    await run_agent(llm, new_history(), tools=TOOLS, executor=FakeCommandExecutor())
+
+    records = agent_log_records(caplog)
+    assert len(records) == 1
+    assert records[0].levelname == "WARNING"
+    message = records[0].getMessage()
+    assert "exec" in message
+    assert "Ошибка разбора arguments" in message
+
+
+async def test_no_tool_log_records_without_tool_calls(caplog):
+    caplog.set_level(logging.INFO, logger=AGENT_LOGGER_NAME)
+    llm = make_scripted_llm([assistant_turn(content="просто ответ")])
+
+    await run_agent(llm, new_history(), tools=TOOLS, executor=FakeCommandExecutor())
+
+    assert agent_log_records(caplog) == []

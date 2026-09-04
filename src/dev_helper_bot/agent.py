@@ -1,16 +1,21 @@
 from __future__ import annotations
 
 import json
+import logging
 from typing import Any
 
 from dev_helper_bot.llm import LLMClient, Message, ToolCall, ToolSpec
 from dev_helper_bot.tools import (
+    EXEC_INFRA_ERROR_PREFIX,
     EXEC_TOOL_NAME,
+    LIST_TOOL_NAME,
     SEARCH_TOOL_NAME,
     CommandExecutor,
     HistorySearcher,
     exec_command,
 )
+
+log = logging.getLogger(__name__)
 
 MAX_LLM_STEPS = 8
 
@@ -112,36 +117,56 @@ async def execute_tool_call(
     call: ToolCall,
     executor: CommandExecutor,
     history_search: HistorySearcher | None = None,
-) -> str:
-    """Исполняет валидированный вызов инструмента; ошибки возвращает как текст.
+) -> tuple[str, bool]:
+    """Исполняет валидированный вызов инструмента; ошибки — текстом.
+
+    Возвращает пару (текст результата для модели, выполнено ли успешно):
+    ошибки выполнения не возбуждаются исключением, а отражаются флагом —
+    так журнал в run_agent различает успех и ошибку по имени инструмента
+    и исходу, не дублируя аргументы и содержимое результата (design D4).
 
     Некорректные аргументы валидируются в агентном цикле до исполнителя
     (validate_tool_call); неизвестный инструмент — по-прежнему не исключение,
     а tool-сообщение с ошибкой: модель видит её и корректирует вызов.
 
-    `history_search` — шов поиска по прошлым беседам (search_history),
-    привязанный к текущему чату; исполнитель команд — только для exec.
+    `history_search` — шов доступа к прошлым беседам (search_history,
+    list_sessions), привязанный к текущему чату; исполнитель команд —
+    только для exec.
     """
     if call["name"] == SEARCH_TOOL_NAME:
         if history_search is None:
             return (
-                f"Ошибка: инструмент {SEARCH_TOOL_NAME!r} сейчас недоступен."
+                f"Ошибка: инструмент {SEARCH_TOOL_NAME!r} сейчас недоступен.",
+                False,
             )
         arguments = json.loads(call["arguments"] or "{}")
         try:
-            return await history_search.search(arguments["query"])
+            return await history_search.search(arguments["query"]), True
         except Exception as exc:
-            return f"Ошибка выполнения инструмента: {exc}"
+            return f"Ошибка выполнения инструмента: {exc}", False
+    if call["name"] == LIST_TOOL_NAME:
+        if history_search is None:
+            return (
+                f"Ошибка: инструмент {LIST_TOOL_NAME!r} сейчас недоступен.",
+                False,
+            )
+        try:
+            return await history_search.list_sessions(), True
+        except Exception as exc:
+            return f"Ошибка выполнения инструмента: {exc}", False
     if call["name"] != EXEC_TOOL_NAME:
         return (
             f"Ошибка: неизвестный инструмент {call['name']!r}. "
-            f"Доступны {EXEC_TOOL_NAME!r} и {SEARCH_TOOL_NAME!r}."
+            f"Доступны {EXEC_TOOL_NAME!r}, {SEARCH_TOOL_NAME!r} "
+            f"и {LIST_TOOL_NAME!r}.",
+            False,
         )
     arguments = json.loads(call["arguments"] or "{}")
     try:
-        return await exec_command(executor, arguments["command"])
+        result = await exec_command(executor, arguments["command"])
     except Exception as exc:
-        return f"Ошибка выполнения инструмента: {exc}"
+        return f"Ошибка выполнения инструмента: {exc}", False
+    return result, not result.startswith(EXEC_INFRA_ERROR_PREFIX)
 
 
 async def run_agent(
@@ -215,11 +240,19 @@ async def run_agent(
             }
         )
         for call, error in zip(turn["tool_calls"], errors):
-            result = (
-                error
-                if error is not None
-                else await execute_tool_call(call, executor, history_search)
-            )
+            if error is not None:
+                log.warning(
+                    "tool %s rejected by validation: %s", call["name"], error
+                )
+                result = error
+            else:
+                result, succeeded = await execute_tool_call(
+                    call, executor, history_search
+                )
+                if succeeded:
+                    log.info("tool %s: success", call["name"])
+                else:
+                    log.info("tool %s: execution error", call["name"])
             history.append(
                 {
                     "role": "tool",

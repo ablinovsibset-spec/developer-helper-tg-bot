@@ -163,6 +163,16 @@ class BrokenExecutor:
         raise RuntimeError("docker daemon is down")
 
 
+class BrokenHistorySearcher:
+    """Двойник шва HistorySearcher: оба метода падают ошибкой выполнения."""
+
+    async def search(self, query: str) -> str:
+        raise RuntimeError("database is closed")
+
+    async def list_sessions(self) -> str:
+        raise RuntimeError("database is closed")
+
+
 @pytest.fixture
 def fake_bot() -> FakeBot:
     return FakeBot()

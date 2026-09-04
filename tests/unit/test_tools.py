@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from dev_helper_bot.tools import (
     HEAD_CHARS,
+    LIST_TOOL_NAME,
+    LIST_TOOL_SPEC,
     OUTPUT_LIMIT,
     TAIL_CHARS,
     ExecResult,
@@ -85,3 +87,11 @@ def test_truncate_output_cuts_middle_with_marker():
     assert truncated.startswith("a" * HEAD_CHARS)
     assert truncated.endswith("B" * TAIL_CHARS)
     assert "обрезано 1000 символов" in truncated
+
+
+def test_list_tool_spec_declares_no_parameters():
+    function = LIST_TOOL_SPEC["function"]
+
+    assert function["name"] == LIST_TOOL_NAME == "list_sessions"
+    assert function["parameters"] == {"type": "object", "properties": {}}
+    assert not (function["parameters"].get("required") or [])

@@ -5,10 +5,13 @@ from typing import Any, Protocol
 
 EXEC_TOOL_NAME = "exec"
 SEARCH_TOOL_NAME = "search_history"
+LIST_TOOL_NAME = "list_sessions"
 EXEC_TIMEOUT_SECONDS = 30.0
 OUTPUT_LIMIT = 3000
 HEAD_CHARS = 1500
 TAIL_CHARS = 1500
+
+EXEC_INFRA_ERROR_PREFIX = "Не удалось выполнить команду"
 
 EXEC_TOOL_SPEC: dict[str, Any] = {
     "type": "function",
@@ -59,6 +62,21 @@ SEARCH_TOOL_SPEC: dict[str, Any] = {
     },
 }
 
+LIST_TOOL_SPEC: dict[str, Any] = {
+    "type": "function",
+    "function": {
+        "name": LIST_TOOL_NAME,
+        "description": (
+            "Обзор завершённых бесед текущего чата (прошлых сессий): "
+            "дата начала каждой беседы, число сообщений и превью её "
+            "начала. Первый шаг при вопросах о прошлых беседах: по "
+            "превью выбери ключевое слово для search_history. "
+            "Параметров нет."
+        ),
+        "parameters": {"type": "object", "properties": {}},
+    },
+}
+
 
 @dataclass(frozen=True)
 class ExecResult:
@@ -86,14 +104,16 @@ class CommandExecutor(Protocol):
 
 
 class HistorySearcher(Protocol):
-    """Шов поиска по прошлым беседам: читающий поиск по завершённым
-    сессиям текущего чата.
+    """Шов доступа к прошлым беседам: читающий поиск по завершённым
+    сессиям текущего чата и их обзор.
 
     Продакшн-реализация — memory.ChatHistorySearcher (обёртка MemoryStore,
     привязанная к chat_id сообщения); в unit-тестах инъектируется двойник.
     """
 
     async def search(self, query: str) -> str: ...
+
+    async def list_sessions(self) -> str: ...
 
 
 def truncate_output(text: str) -> str:
@@ -135,7 +155,7 @@ async def exec_command(
     try:
         result = await executor.execute(command, timeout)
     except Exception as exc:
-        return f"Не удалось выполнить команду: {exc}"
+        return f"{EXEC_INFRA_ERROR_PREFIX}: {exc}"
     return truncate_output(
         format_result(
             exit_code=result.exit_code,

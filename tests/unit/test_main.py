@@ -17,7 +17,7 @@ from dev_helper_bot.main import (
     send_chunked,
 )
 from dev_helper_bot.memory import MemoryStore
-from dev_helper_bot.skills import SANDBOX_ENV_LINE
+from dev_helper_bot.skills import MEMORY_ENV_LINE, SANDBOX_ENV_LINE
 
 from tests.conftest import (
     FakeCommandExecutor,
@@ -35,11 +35,13 @@ T2 = datetime(2026, 8, 28, 7, 47)
 SYSTEM_AT_T1 = (
     "Reasoning: medium\nТекущие дата и время: 2026-08-28 07:45 (пятница)"
     f"\n{SANDBOX_ENV_LINE}"
+    f"\n{MEMORY_ENV_LINE}"
     "\n\n## wttr-in-api\nПравила wttr.in"
 )
 SYSTEM_AT_T2 = (
     "Reasoning: medium\nТекущие дата и время: 2026-08-28 07:47 (пятница)"
     f"\n{SANDBOX_ENV_LINE}"
+    f"\n{MEMORY_ENV_LINE}"
     "\n\n## wttr-in-api\nПравила wttr.in"
 )
 
