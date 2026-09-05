@@ -89,12 +89,109 @@ async def test_complete_without_tools_returns_turn_without_calls(fake_llm_server
         "content": "тест-ответ",
         "tool_calls": [],
         "finish_reason": "stop",
+        "usage": None,
     }
     assert len(fake_llm_server.requests) == 1
     request = fake_llm_server.requests[0]
     assert request["json"] == {"model": MODEL, "messages": MESSAGES}
     assert "tools" not in request["json"]
     assert request["headers"]["Content-Type"] == "application/json"
+
+
+def usage_payload(
+    prompt: int | None = 10,
+    completion: int | None = 5,
+    cached: int | None = None,
+    reasoning: int | None = None,
+) -> dict[str, Any]:
+    usage: dict[str, Any] = {}
+    if prompt is not None:
+        usage["prompt_tokens"] = prompt
+    if completion is not None:
+        usage["completion_tokens"] = completion
+    if cached is not None:
+        usage["prompt_tokens_details"] = {"cached_tokens": cached}
+    if reasoning is not None:
+        usage["completion_tokens_details"] = {"reasoning_tokens": reasoning}
+    return usage
+
+
+async def test_complete_with_full_usage_carries_all_fields(fake_llm_server):
+    """Сценарий «Ответ содержит usage»: полный usage — все четыре значения."""
+    usage = usage_payload(prompt=100, completion=40, cached=60, reasoning=12)
+    fake_llm_server.payload = {
+        "choices": [
+            {"message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}
+        ],
+        "usage": usage,
+    }
+    client = make_client(fake_llm_server.base_url)
+
+    turn = await client.complete(MESSAGES)
+
+    assert turn["usage"] == {
+        "input_tokens": 100,
+        "output_tokens": 40,
+        "cached_tokens": 60,
+        "reasoning_tokens": 12,
+        "raw": usage,
+    }
+
+
+async def test_complete_with_partial_usage_keeps_missing_fields_null(
+    fake_llm_server,
+):
+    """Сценарий «Ответ без части полей»: cached/reasoning нет — они null."""
+    usage = usage_payload(prompt=7, completion=3, cached=None, reasoning=None)
+    fake_llm_server.payload = {
+        "choices": [
+            {"message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}
+        ],
+        "usage": usage,
+    }
+    client = make_client(fake_llm_server.base_url)
+
+    turn = await client.complete(MESSAGES)
+
+    assert turn["usage"] is not None
+    assert turn["usage"]["input_tokens"] == 7
+    assert turn["usage"]["output_tokens"] == 3
+    assert turn["usage"]["cached_tokens"] is None
+    assert turn["usage"]["reasoning_tokens"] is None
+    assert turn["usage"]["raw"] == usage
+
+
+async def test_complete_without_usage_carries_null_usage(fake_llm_server):
+    """Сценарий «Ответ без usage»: ход несёт null-usage и разбирается без ошибки."""
+    fake_llm_server.payload = {
+        "choices": [
+            {"message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}
+        ]
+    }
+    client = make_client(fake_llm_server.base_url)
+
+    turn = await client.complete(MESSAGES)
+
+    assert turn["content"] == "ok"
+    assert turn["tool_calls"] == []
+    assert turn["usage"] is None
+
+
+async def test_complete_with_non_integer_usage_fields_keeps_null(fake_llm_server):
+    """Мусор в usage не роняет разбор: нечисловые поля остаются null."""
+    fake_llm_server.payload = {
+        "choices": [
+            {"message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}
+        ],
+        "usage": {"prompt_tokens": "много", "completion_tokens": None},
+    }
+    client = make_client(fake_llm_server.base_url)
+
+    turn = await client.complete(MESSAGES)
+
+    assert turn["usage"] is not None
+    assert turn["usage"]["input_tokens"] is None
+    assert turn["usage"]["output_tokens"] is None
 
 
 async def test_api_key_adds_bearer_header(fake_llm_server):

@@ -13,6 +13,7 @@ from .base import (
     ResponseFormat,
     ToolCall,
     ToolSpec,
+    Usage,
 )
 
 DEFAULT_TIMEOUT_SECONDS = 120.0
@@ -52,11 +53,52 @@ def _serialize_message(message: Message) -> dict[str, Any]:
     return wire
 
 
+def _int_or_none(value: Any) -> int | None:
+    """Число из ответа поставщика; всё остальное — null (absence ≠ 0)."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value
+
+
+def _parse_usage(data: dict[str, Any]) -> Usage | None:
+    """Извлекает usage из ответа /chat/completions; отсутствие — None.
+
+    Понимает OpenAI-совместимую форму (prompt_tokens/completion_tokens
+    + *_tokens_details) и устойчива к неполному ответу: поля, которых
+    нет, остаются null. `raw` хранит исходный объект как есть.
+    """
+    usage = data.get("usage")
+    if not isinstance(usage, dict):
+        return None
+    prompt_details = usage.get("prompt_tokens_details")
+    completion_details = usage.get("completion_tokens_details")
+    return {
+        "input_tokens": _int_or_none(
+            usage.get("prompt_tokens", usage.get("input_tokens"))
+        ),
+        "output_tokens": _int_or_none(
+            usage.get("completion_tokens", usage.get("output_tokens"))
+        ),
+        "cached_tokens": _int_or_none(
+            (prompt_details or {}).get("cached_tokens")
+            if isinstance(prompt_details, dict)
+            else None
+        ),
+        "reasoning_tokens": _int_or_none(
+            (completion_details or {}).get("reasoning_tokens")
+            if isinstance(completion_details, dict)
+            else None
+        ),
+        "raw": usage,
+    }
+
+
 def _parse_turn(data: dict[str, Any]) -> AssistantTurn:
     """Извлекает ход ассистента из ответа /chat/completions.
 
     `reasoning` (если поставщик его прислал) отбрасывается: в контракт
-    и в историю он не попадает.
+    и в историю он не попадает. `usage` проходит в ход: отсутствие —
+    null, на разбор текста/вызовов не влияет.
     """
     choice = data["choices"][0]
     message = choice["message"]
@@ -72,6 +114,7 @@ def _parse_turn(data: dict[str, Any]) -> AssistantTurn:
         "content": message.get("content"),
         "tool_calls": tool_calls,
         "finish_reason": choice.get("finish_reason") or "stop",
+        "usage": _parse_usage(data),
     }
 
 

@@ -82,11 +82,13 @@ def assistant_turn(
     content: str | None = "ok",
     tool_calls: list[ToolCall] | None = None,
     finish_reason: str = "stop",
+    usage: dict | None = None,
 ) -> AssistantTurn:
     return {
         "content": content,
         "tool_calls": tool_calls or [],
         "finish_reason": finish_reason,
+        "usage": usage,
     }
 
 

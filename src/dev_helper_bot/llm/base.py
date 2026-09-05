@@ -32,15 +32,36 @@ class Message(_MessageRequired, total=False):
     tool_call_id: str
 
 
-class AssistantTurn(TypedDict):
-    """Ход ассистента: финальный текст и/или вызовы инструментов.
+class Usage(TypedDict):
+    """Метаданные использования поставщика из ответа (design D1/D8).
 
-    Reasoning-поле ответа поставщика сюда не попадает и в историю не пишется.
+    Поля, которых ответ не содержит, — null, а не ноль: absence ≠ 0.
+    `raw` — исходный usage-объект ответа как есть (для доизвлечения
+    без миграций).
     """
 
+    input_tokens: int | None
+    output_tokens: int | None
+    cached_tokens: int | None
+    reasoning_tokens: int | None
+    raw: dict[str, Any]
+
+
+class _AssistantTurnRequired(TypedDict):
     content: str | None
     tool_calls: list[ToolCall]
     finish_reason: str
+
+
+class AssistantTurn(_AssistantTurnRequired, total=False):
+    """Ход ассистента: финальный текст и/или вызовы инструментов.
+
+    Reasoning-поле ответа поставщика сюда не попадает и в историю не пишется.
+    `usage` — метаданные использования поставщика, если ответ их содержит
+    (иначе null); на разбор хода не влияет.
+    """
+
+    usage: Usage | None
 
 
 ToolSpec = dict[str, Any]

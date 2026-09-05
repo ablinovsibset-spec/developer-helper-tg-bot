@@ -6,18 +6,34 @@ from dev_helper_bot.config import (
     DEFAULT_BASE_URL,
     DEFAULT_MEMORY_DB_PATH,
     DEFAULT_MODEL,
+    DEFAULT_OBS_DB_PATH,
+    DEFAULT_OBS_PRICE_INPUT_PER_M,
+    DEFAULT_OBS_PRICE_OUTPUT_PER_M,
     make_llm,
+    llm_model_name,
     memory_db_path,
+    obs_db_path,
+    obs_label,
+    obs_price_input_per_m,
+    obs_price_output_per_m,
     telegram_token,
 )
 from dev_helper_bot.llm.openai_compat import OpenAICompatibleClient
 
 LLM_ENV_VARS = ("LLM_PROVIDER", "LLM_BASE_URL", "LLM_MODEL", "LLM_API_KEY")
+OBS_ENV_VARS = (
+    "OBS_DB_PATH",
+    "OBS_PRICE_INPUT_PER_M",
+    "OBS_PRICE_OUTPUT_PER_M",
+    "OBS_LABEL",
+)
 
 
 @pytest.fixture(autouse=True)
 def clean_llm_env(monkeypatch: pytest.MonkeyPatch) -> None:
     for var in LLM_ENV_VARS:
+        monkeypatch.delenv(var, raising=False)
+    for var in OBS_ENV_VARS:
         monkeypatch.delenv(var, raising=False)
 
 
@@ -69,3 +85,48 @@ def test_memory_db_path_env_override_wins(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setenv("MEMORY_DB_PATH", "/tmp/custom-memory.db")
 
     assert memory_db_path() == "/tmp/custom-memory.db"
+
+
+def test_llm_model_name_default_and_env_override(monkeypatch: pytest.MonkeyPatch):
+    assert llm_model_name() == DEFAULT_MODEL
+    monkeypatch.setenv("LLM_MODEL", "llama-3.2-3b-instruct")
+
+    assert llm_model_name() == "llama-3.2-3b-instruct"
+
+
+def test_obs_db_path_defaults_to_vm_local_disk(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.delenv("OBS_DB_PATH", raising=False)
+
+    assert obs_db_path() == DEFAULT_OBS_DB_PATH
+    # VM-локальный диск, не workspace-маунт (design D4)
+    assert DEFAULT_OBS_DB_PATH.startswith("~/")
+    assert not DEFAULT_OBS_DB_PATH.startswith(("/", "."))
+
+
+def test_obs_db_path_env_override_wins(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("OBS_DB_PATH", "/tmp/custom-obs.db")
+
+    assert obs_db_path() == "/tmp/custom-obs.db"
+
+
+def test_obs_price_defaults_document_gpt_oss_20b():
+    """Дефолтный прайс — цены запуска gpt-oss-20b в API OpenAI (design D5)."""
+    assert DEFAULT_OBS_PRICE_INPUT_PER_M == 0.11
+    assert DEFAULT_OBS_PRICE_OUTPUT_PER_M == 0.60
+    assert obs_price_input_per_m() == 0.11
+    assert obs_price_output_per_m() == 0.60
+
+
+def test_obs_price_env_override_wins(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("OBS_PRICE_INPUT_PER_M", "1.5")
+    monkeypatch.setenv("OBS_PRICE_OUTPUT_PER_M", "9")
+
+    assert obs_price_input_per_m() == 1.5
+    assert obs_price_output_per_m() == 9.0
+
+
+def test_obs_label_defaults_to_none_and_follows_env(monkeypatch: pytest.MonkeyPatch):
+    assert obs_label() is None
+    monkeypatch.setenv("OBS_LABEL", "before-optimization")
+
+    assert obs_label() == "before-optimization"

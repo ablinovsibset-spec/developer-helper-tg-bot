@@ -2,9 +2,15 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import Any
+import time
+from typing import TYPE_CHECKING, Any
 
 from dev_helper_bot.llm import LLMClient, Message, ToolCall, ToolSpec
+from dev_helper_bot.telemetry import (
+    RUN_STATUS_STEPS_EXHAUSTED,
+    RUN_STATUS_SUCCESS,
+    RUN_STATUS_VALIDATION_ERROR,
+)
 from dev_helper_bot.tools import (
     EXEC_INFRA_ERROR_PREFIX,
     EXEC_TOOL_NAME,
@@ -14,6 +20,9 @@ from dev_helper_bot.tools import (
     HistorySearcher,
     exec_command,
 )
+
+if TYPE_CHECKING:
+    from dev_helper_bot.telemetry import RunRecorder
 
 log = logging.getLogger(__name__)
 
@@ -176,6 +185,7 @@ async def run_agent(
     *,
     executor: CommandExecutor,
     history_search: HistorySearcher | None = None,
+    recorder: RunRecorder | None = None,
 ) -> str:
     """Агентный цикл: LLM → валидация хода → tool_calls → результаты в историю → повтор.
 
@@ -193,13 +203,23 @@ async def run_agent(
     Исполнитель команд передаётся готовым и переживает сообщения:
     жизненным циклом песочницы владеет main (design D5) — контейнер-жилец
     создаётся при первом exec и удаляется при завершении процесса бота.
+
+    `recorder` — опциональная телеметрия прогона (design D2/D3): tool-вызовы
+    фиксируются в точке формирования tool-сообщения (имя, размеры, длительность,
+    исход — включая отказ валидации с нулевой длительностью), терминальные
+    возвраты финализируют прогон статусом. Телеметрия best-effort и не влияет
+    на ответы модели и исполнение инструментов.
     """
     specs_by_name: dict[str, ToolSpec] = {
         (spec.get("function") or {}).get("name"): spec for spec in tools or []
     }
     validation_failures = 0
 
-    for _ in range(MAX_LLM_STEPS):
+    async def finalize(status: str) -> None:
+        if recorder is not None:
+            await recorder.finish(status)
+
+    for turn_number in range(1, MAX_LLM_STEPS + 1):
         turn = await llm.complete(history, tools)
 
         if turn["tool_calls"]:
@@ -213,10 +233,12 @@ async def run_agent(
         # Сначала валидация, потом finish_reason (design D4): ретраи
         # не чинят обрыв генерации, валидный ответ при length принимается.
         if failed and turn["finish_reason"] == "length":
+            await finalize(RUN_STATUS_VALIDATION_ERROR)
             return RESPONSE_TRUNCATED_MESSAGE
         if failed:
             validation_failures += 1
             if validation_failures >= MAX_JSON_RETRIES:
+                await finalize(RUN_STATUS_VALIDATION_ERROR)
                 return JSON_RETRIES_EXHAUSTED_MESSAGE
         else:
             validation_failures = 0
@@ -230,6 +252,7 @@ async def run_agent(
                 continue
             reply = turn["content"] or ""
             history.append({"role": "assistant", "content": reply})
+            await finalize(RUN_STATUS_SUCCESS)
             return reply
 
         history.append(
@@ -245,14 +268,34 @@ async def run_agent(
                     "tool %s rejected by validation: %s", call["name"], error
                 )
                 result = error
+                if recorder is not None:
+                    await recorder.record_tool_call(
+                        turn_number=turn_number,
+                        tool_name=call["name"],
+                        input_size=len(call["arguments"] or ""),
+                        output_size=len(result),
+                        duration_ms=0.0,
+                        ok=False,
+                    )
             else:
+                tool_started = time.perf_counter()
                 result, succeeded = await execute_tool_call(
                     call, executor, history_search
                 )
+                duration_ms = (time.perf_counter() - tool_started) * 1000
                 if succeeded:
                     log.info("tool %s: success", call["name"])
                 else:
                     log.info("tool %s: execution error", call["name"])
+                if recorder is not None:
+                    await recorder.record_tool_call(
+                        turn_number=turn_number,
+                        tool_name=call["name"],
+                        input_size=len(call["arguments"] or ""),
+                        output_size=len(result),
+                        duration_ms=duration_ms,
+                        ok=succeeded,
+                    )
             history.append(
                 {
                     "role": "tool",
@@ -260,4 +303,5 @@ async def run_agent(
                     "content": result,
                 }
             )
+    await finalize(RUN_STATUS_STEPS_EXHAUSTED)
     return STEPS_EXHAUSTED_MESSAGE

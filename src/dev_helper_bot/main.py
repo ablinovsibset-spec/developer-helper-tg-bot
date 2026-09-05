@@ -12,11 +12,26 @@ from aiogram.types import Message as TgMessage
 from dotenv import load_dotenv
 
 from dev_helper_bot.agent import run_agent
-from dev_helper_bot.config import make_llm, memory_db_path, telegram_token
+from dev_helper_bot.config import (
+    llm_model_name,
+    make_llm,
+    memory_db_path,
+    obs_db_path,
+    obs_label,
+    obs_price_input_per_m,
+    obs_price_output_per_m,
+    telegram_token,
+)
 from dev_helper_bot.llm import LLMClient, LLMUnavailable, Message
 from dev_helper_bot.memory import ChatHistorySearcher, MemoryStore
 from dev_helper_bot.sandbox import SandboxExecutor, prepare_sandbox_environment
 from dev_helper_bot.skills import build_system_prompt, default_skills_dir, load_skills
+from dev_helper_bot.telemetry import (
+    RUN_STATUS_LLM_ERROR,
+    ObservingClient,
+    RunRecorder,
+    TelemetryStore,
+)
 from dev_helper_bot.tools import (
     EXEC_TOOL_SPEC,
     LIST_TOOL_SPEC,
@@ -50,6 +65,7 @@ async def handle_text(
     memory: MemoryStore,
     skills: dict[str, str],
     executor: CommandExecutor,
+    telemetry: TelemetryStore | None = None,
 ) -> None:
     chat_id = message.chat.id
     user_text = message.text or ""
@@ -61,17 +77,37 @@ async def handle_text(
     await memory.append_user(chat_id, user_text)
     history.append({"role": "user", "content": user_text})
 
+    # Телеметрия прогона (design D2): recorder на каждое сообщение, LLM —
+    # в наблюдающей обёртке. Телеметрия best-effort и не влияет на ответы.
+    recorder: RunRecorder | None = None
+    client = llm
+    if telemetry is not None:
+        recorder = RunRecorder(
+            telemetry,
+            chat_id,
+            obs_label(),
+            price_input_per_m=obs_price_input_per_m(),
+            price_output_per_m=obs_price_output_per_m(),
+        )
+        await recorder.start()
+        client = ObservingClient(llm, recorder, model=llm_model_name())
+
     await bot.send_message(chat_id=chat_id, text=WAITING_MESSAGE)
     try:
         reply = await run_agent(
-            llm,
+            client,
             history,
             tools=AGENT_TOOLS,
             executor=executor,
             history_search=ChatHistorySearcher(memory, chat_id),
+            recorder=recorder,
         )
     except LLMUnavailable as exc:
         log.warning("LLM unavailable: %s", exc)
+        # Ветка LLMUnavailable финализируется здесь (design D2): run_agent
+        # терминальные возвраты закрывает сам, исключение проходит мимо.
+        if recorder is not None:
+            await recorder.finish(RUN_STATUS_LLM_ERROR)
         await bot.send_message(
             chat_id=chat_id,
             text=(
@@ -102,9 +138,18 @@ async def main() -> None:
     executor = SandboxExecutor()
     memory = MemoryStore(memory_db_path())
     await memory.open()
+    # Телеметрия — тот же паттерн владения, что у памяти (design D4);
+    # сбой открытия не роняет бота: наблюдение не может стать причиной отказа.
+    telemetry: TelemetryStore | None = TelemetryStore(obs_db_path())
+    try:
+        await telemetry.open()
+    except Exception:
+        log.warning("telemetry disabled: cannot open %s", obs_db_path(), exc_info=True)
+        telemetry = None
     dp = Dispatcher()
     dp["llm"] = llm
     dp["memory"] = memory
+    dp["telemetry"] = telemetry
     dp["skills"] = load_skills(default_skills_dir())
     dp["executor"] = executor
     dp.message.register(handle_new, Command("new"))
@@ -119,6 +164,8 @@ async def main() -> None:
         # аварийного завершения контейнер подберёт sweep при следующем старте.
         await executor.stop()
         await memory.close()
+        if telemetry is not None:
+            await telemetry.close()
         await bot.session.close()
 
 

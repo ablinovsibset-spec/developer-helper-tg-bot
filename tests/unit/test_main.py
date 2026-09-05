@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sqlite3
 from datetime import datetime
 
 import pytest
@@ -411,6 +412,7 @@ async def test_main_opens_and_closes_memory_store(fake_bot, monkeypatch, tmp_pat
     monkeypatch.setattr(main_module, "prepare_sandbox_environment", fake_prepare)
     monkeypatch.setattr(main_module, "SandboxExecutor", lambda: executor)
     monkeypatch.setattr(main_module, "memory_db_path", lambda: str(tmp_path / "m.db"))
+    monkeypatch.setattr(main_module, "obs_db_path", lambda: str(tmp_path / "obs.db"))
     monkeypatch.setattr(main_module, "Bot", FakeMainBot)
     monkeypatch.setattr(
         main_module.Dispatcher, "start_polling", FakeDispatcher.start_polling
@@ -430,3 +432,13 @@ async def test_main_opens_and_closes_memory_store(fake_bot, monkeypatch, tmp_pat
         ]
     finally:
         await reopened.close()
+    # БД телеметрии создана со схемой (store открыт и закрыт main'ом)
+    assert (tmp_path / "obs.db").exists()
+    with sqlite3.connect(tmp_path / "obs.db") as conn:
+        tables = {
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
+        }
+    assert {"runs", "llm_calls", "tool_calls"} <= tables
