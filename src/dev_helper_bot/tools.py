@@ -1,23 +1,27 @@
 from __future__ import annotations
 
-import asyncio
-import os
-import signal
-from typing import Any
+from dataclasses import dataclass
+from typing import Any, Protocol
 
 EXEC_TOOL_NAME = "exec"
+SEARCH_TOOL_NAME = "search_history"
+LIST_TOOL_NAME = "list_sessions"
 EXEC_TIMEOUT_SECONDS = 30.0
 OUTPUT_LIMIT = 3000
 HEAD_CHARS = 1500
 TAIL_CHARS = 1500
+
+EXEC_INFRA_ERROR_PREFIX = "Не удалось выполнить команду"
 
 EXEC_TOOL_SPEC: dict[str, Any] = {
     "type": "function",
     "function": {
         "name": EXEC_TOOL_NAME,
         "description": (
-            "Выполнить консольную команду в shell системы и вернуть "
-            "stdout, stderr и код выхода. Поддерживаются пайпы и &&."
+            "Выполнить консольную команду в изолированном Linux-контейнере (Alpine) "
+            "и вернуть stdout, stderr и код выхода. Поддерживаются пайпы и &&. "
+            "Файлы и установленные пакеты переживают сообщения (сброс — только "
+            "пересозданием контейнера)."
         ),
         "parameters": {
             "type": "object",
@@ -31,6 +35,85 @@ EXEC_TOOL_SPEC: dict[str, Any] = {
         },
     },
 }
+
+SEARCH_TOOL_SPEC: dict[str, Any] = {
+    "type": "function",
+    "function": {
+        "name": SEARCH_TOOL_NAME,
+        "description": (
+            "Поиск по завершённым беседам текущего чата (прошлым сессиям). "
+            "Возвращает выдержки найденных сообщений с датой беседы и ролью "
+            "автора. Используй, когда пользователь спрашивает о том, что "
+            "обсуждалось раньше."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": (
+                        "Поисковый запрос: слово или фраза, которые могли "
+                        "встретиться в прошлой беседе"
+                    ),
+                },
+            },
+            "required": ["query"],
+        },
+    },
+}
+
+LIST_TOOL_SPEC: dict[str, Any] = {
+    "type": "function",
+    "function": {
+        "name": LIST_TOOL_NAME,
+        "description": (
+            "Обзор завершённых бесед текущего чата (прошлых сессий): "
+            "дата начала каждой беседы, число сообщений и превью её "
+            "начала. Первый шаг при вопросах о прошлых беседах: по "
+            "превью выбери ключевое слово для search_history. "
+            "Параметров нет."
+        ),
+        "parameters": {"type": "object", "properties": {}},
+    },
+}
+
+
+@dataclass(frozen=True)
+class ExecResult:
+    """Сырой результат команды: контракт между исполнителем и форматированием."""
+
+    exit_code: int
+    stdout: str
+    stderr: str
+    timed_out: bool = False
+
+
+class CommandExecutor(Protocol):
+    """Шов исполнителя команд: выполнение команды + уборка при завершении.
+
+    Продакшн-реализация — Docker-песочница (sandbox.SandboxExecutor):
+    один долгоживущий контейнер-жилец на процесс бота, создаётся лениво
+    при первом `execute()`; в unit-тестах инъектируется двойник.
+    """
+
+    async def execute(
+        self, command: str, timeout: float = EXEC_TIMEOUT_SECONDS
+    ) -> ExecResult: ...
+
+    async def stop(self) -> None: ...
+
+
+class HistorySearcher(Protocol):
+    """Шов доступа к прошлым беседам: читающий поиск по завершённым
+    сессиям текущего чата и их обзор.
+
+    Продакшн-реализация — memory.ChatHistorySearcher (обёртка MemoryStore,
+    привязанная к chat_id сообщения); в unit-тестах инъектируется двойник.
+    """
+
+    async def search(self, query: str) -> str: ...
+
+    async def list_sessions(self) -> str: ...
 
 
 def truncate_output(text: str) -> str:
@@ -59,52 +142,26 @@ def format_result(
     return "\n".join(parts)
 
 
-def _kill_process_group(process: asyncio.subprocess.Process) -> None:
-    """Принудительно завершает процесс и его группу (защита от зомби)."""
-    try:
-        os.killpg(process.pid, signal.SIGKILL)
-    except (ProcessLookupError, PermissionError, OSError):
-        process.kill()
-
-
-async def exec_command(command: str, timeout: float = EXEC_TIMEOUT_SECONDS) -> str:
-    """Выполняет команду в shell и возвращает текст-результат для модели.
+async def exec_command(
+    executor: CommandExecutor,
+    command: str,
+    timeout: float = EXEC_TIMEOUT_SECONDS,
+) -> str:
+    """Выполняет команду через исполнитель и возвращает текст для модели.
 
     Ошибки выполнения не возбуждаются исключением — модель получает
     их описание как результат вызова инструмента.
     """
     try:
-        process = await asyncio.create_subprocess_shell(
-            command,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            start_new_session=True,
-        )
+        result = await executor.execute(command, timeout)
     except Exception as exc:
-        return f"Не удалось запустить процесс: {exc}"
-
-    timed_out = False
-    stdout_bytes = b""
-    stderr_bytes = b""
-    exit_code = -1
-    try:
-        stdout_bytes, stderr_bytes = await asyncio.wait_for(
-            process.communicate(), timeout=timeout
-        )
-        exit_code = process.returncode if process.returncode is not None else -1
-    except asyncio.TimeoutError:
-        timed_out = True
-        _kill_process_group(process)
-        await process.wait()
-
-    stdout = stdout_bytes.decode(errors="replace")
-    stderr = stderr_bytes.decode(errors="replace")
+        return f"{EXEC_INFRA_ERROR_PREFIX}: {exc}"
     return truncate_output(
         format_result(
-            exit_code=exit_code,
-            stdout=stdout,
-            stderr=stderr,
-            timed_out=timed_out,
+            exit_code=result.exit_code,
+            stdout=result.stdout,
+            stderr=result.stderr,
+            timed_out=result.timed_out,
             timeout=timeout,
         )
     )

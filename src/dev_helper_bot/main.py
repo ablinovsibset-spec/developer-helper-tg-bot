@@ -12,16 +12,23 @@ from aiogram.types import Message as TgMessage
 from dotenv import load_dotenv
 
 from dev_helper_bot.agent import run_agent
-from dev_helper_bot.config import make_llm, telegram_token
+from dev_helper_bot.config import make_llm, memory_db_path, telegram_token
 from dev_helper_bot.llm import LLMClient, LLMUnavailable, Message
+from dev_helper_bot.memory import ChatHistorySearcher, MemoryStore
+from dev_helper_bot.sandbox import SandboxExecutor, prepare_sandbox_environment
 from dev_helper_bot.skills import build_system_prompt, default_skills_dir, load_skills
-from dev_helper_bot.tools import EXEC_TOOL_SPEC
+from dev_helper_bot.tools import (
+    EXEC_TOOL_SPEC,
+    LIST_TOOL_SPEC,
+    SEARCH_TOOL_SPEC,
+    CommandExecutor,
+)
 
 TELEGRAM_MESSAGE_LIMIT = 4096
 WAITING_MESSAGE = "⏳ Готовлю ответ…"
 NEW_CHAT_CONFIRMATION = "🆕 Контекст сброшен — начинаем новый диалог."
 
-ChatHistories = dict[int, list[Message]]
+AGENT_TOOLS = [EXEC_TOOL_SPEC, SEARCH_TOOL_SPEC, LIST_TOOL_SPEC]
 
 logging.basicConfig(
     level=logging.INFO,
@@ -36,50 +43,49 @@ async def send_chunked(bot: Bot, chat_id: int, text: str) -> None:
         await bot.send_message(chat_id=chat_id, text=chunk)
 
 
-def chat_history(
-    histories: ChatHistories, chat_id: int, system_prompt: str
-) -> list[Message]:
-    """История чата; системное сообщение обновляется актуальным промптом."""
-    history = histories.get(chat_id)
-    if not history:
-        history = [{"role": "system", "content": system_prompt}]
-        histories[chat_id] = history
-    else:
-        history[0]["content"] = system_prompt
-    return history
-
-
 async def handle_text(
     message: TgMessage,
     bot: Bot,
     llm: LLMClient,
-    histories: ChatHistories,
+    memory: MemoryStore,
     skills: dict[str, str],
+    executor: CommandExecutor,
 ) -> None:
+    chat_id = message.chat.id
+    user_text = message.text or ""
+    # Канон — БД (design D4): контекст открытой сессии восстанавливается из
+    # хранилища, транскрипт инструментов живёт только в рамках этой обработки.
     system_prompt = build_system_prompt(skills, datetime.now())
-    history = chat_history(histories, message.chat.id, system_prompt)
-    history.append({"role": "user", "content": message.text or ""})
+    history: list[Message] = [{"role": "system", "content": system_prompt}]
+    history += await memory.load_open_history(chat_id)
+    await memory.append_user(chat_id, user_text)
+    history.append({"role": "user", "content": user_text})
 
-    await bot.send_message(chat_id=message.chat.id, text=WAITING_MESSAGE)
+    await bot.send_message(chat_id=chat_id, text=WAITING_MESSAGE)
     try:
-        reply = await run_agent(llm, history, tools=[EXEC_TOOL_SPEC])
+        reply = await run_agent(
+            llm,
+            history,
+            tools=AGENT_TOOLS,
+            executor=executor,
+            history_search=ChatHistorySearcher(memory, chat_id),
+        )
     except LLMUnavailable as exc:
         log.warning("LLM unavailable: %s", exc)
         await bot.send_message(
-            chat_id=message.chat.id,
+            chat_id=chat_id,
             text=(
                 "⚠️ LLM сейчас недоступна. Проверьте, что сервер запущен, "
                 "и попробуйте ещё раз."
             ),
         )
         return
-    await send_chunked(bot, message.chat.id, reply)
+    await memory.append_assistant(chat_id, reply)
+    await send_chunked(bot, chat_id, reply)
 
 
-async def handle_new(
-    message: TgMessage, bot: Bot, histories: ChatHistories
-) -> None:
-    histories[message.chat.id] = []
+async def handle_new(message: TgMessage, bot: Bot, memory: MemoryStore) -> None:
+    await memory.close_session(message.chat.id)
     await bot.send_message(chat_id=message.chat.id, text=NEW_CHAT_CONFIRMATION)
 
 
@@ -92,10 +98,15 @@ async def main() -> None:
         token=token,
         default=DefaultBotProperties(parse_mode=ParseMode.HTML),
     )
+    await prepare_sandbox_environment()
+    executor = SandboxExecutor()
+    memory = MemoryStore(memory_db_path())
+    await memory.open()
     dp = Dispatcher()
     dp["llm"] = llm
-    dp["histories"] = {}
+    dp["memory"] = memory
     dp["skills"] = load_skills(default_skills_dir())
+    dp["executor"] = executor
     dp.message.register(handle_new, Command("new"))
     dp.message.register(handle_text, F.text)
 
@@ -103,6 +114,11 @@ async def main() -> None:
     try:
         await dp.start_polling(bot)
     finally:
+        # Контейнер-жильца убираем best-effort: ошибки удаления не должны
+        # прерывать завершение (спека docker-sandbox). Оставшийся после
+        # аварийного завершения контейнер подберёт sweep при следующем старте.
+        await executor.stop()
+        await memory.close()
         await bot.session.close()
 
 

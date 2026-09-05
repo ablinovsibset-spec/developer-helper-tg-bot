@@ -10,11 +10,21 @@ from .base import (
     LLMClient,
     LLMUnavailable,
     Message,
+    ResponseFormat,
     ToolCall,
     ToolSpec,
 )
 
 DEFAULT_TIMEOUT_SECONDS = 120.0
+
+
+class _HTTPError(Exception):
+    """HTTP-ответ >= 400 от поставщика; статус и тело для диагностики."""
+
+    def __init__(self, status: int, body: str) -> None:
+        super().__init__(f"HTTP {status}: {body}")
+        self.status = status
+        self.body = body
 
 
 def _serialize_message(message: Message) -> dict[str, Any]:
@@ -77,11 +87,13 @@ class OpenAICompatibleClient(LLMClient):
         self._model = model
         self._api_key = api_key or None
         self._timeout = timeout
+        self._response_format_supported = True
 
     async def complete(
         self,
         messages: list[Message],
         tools: list[ToolSpec] | None = None,
+        response_format: ResponseFormat | None = None,
     ) -> AssistantTurn:
         url = f"{self._base_url}/chat/completions"
         headers: dict[str, str] = {"Content-Type": "application/json"}
@@ -93,17 +105,42 @@ class OpenAICompatibleClient(LLMClient):
         }
         if tools:
             payload["tools"] = tools
+        if response_format is not None and self._response_format_supported:
+            payload["response_format"] = response_format
 
+        try:
+            data = await self._request(url, headers, payload)
+        except _HTTPError as exc:
+            # Деградация: 400 на запрос с response_format — поставщик поле
+            # не поддерживает. Повторяем без поля, факт кэшируется
+            # до конца жизни процесса (design D5).
+            if exc.status == 400 and "response_format" in payload:
+                self._response_format_supported = False
+                del payload["response_format"]
+                data = await self._request(url, headers, payload)
+            else:
+                raise LLMUnavailable(
+                    f"LLM returned HTTP {exc.status}: {exc.body[:200]}"
+                ) from exc
+
+        try:
+            return _parse_turn(data)
+        except (KeyError, IndexError, TypeError) as exc:
+            raise LLMUnavailable(f"Malformed LLM response: {data!r}") from exc
+
+    async def _request(
+        self, url: str, headers: dict[str, str], payload: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Один POST к /chat/completions; HTTP >= 400 — _HTTPError."""
         try:
             timeout = aiohttp.ClientTimeout(total=self._timeout)
             async with aiohttp.ClientSession(timeout=timeout) as session:
                 async with session.post(url, json=payload, headers=headers) as resp:
                     if resp.status >= 400:
-                        body = await resp.text()
-                        raise LLMUnavailable(
-                            f"LLM returned HTTP {resp.status}: {body[:200]}"
-                        )
-                    data = await resp.json()
+                        raise _HTTPError(resp.status, await resp.text())
+                    return await resp.json()
+        except _HTTPError:
+            raise
         except asyncio.TimeoutError as exc:
             raise LLMUnavailable(
                 f"LLM request timed out after {self._timeout}s"
@@ -114,8 +151,3 @@ class OpenAICompatibleClient(LLMClient):
             raise
         except Exception as exc:
             raise LLMUnavailable(f"Unexpected LLM error: {exc}") from exc
-
-        try:
-            return _parse_turn(data)
-        except (KeyError, IndexError, TypeError) as exc:
-            raise LLMUnavailable(f"Malformed LLM response: {data!r}") from exc

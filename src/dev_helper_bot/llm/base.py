@@ -45,6 +45,11 @@ class AssistantTurn(TypedDict):
 
 ToolSpec = dict[str, Any]
 
+ResponseFormat = dict[str, Any]
+"""Указание формата ответа (например, json_schema) в wire-формате
+OpenAI-совместимого API. Поставщик без поддержки получает запрос
+без этого поля — деградация, а не ошибка."""
+
 
 @runtime_checkable
 class LLMClient(Protocol):
@@ -52,6 +57,7 @@ class LLMClient(Protocol):
         self,
         messages: list[Message],
         tools: list[ToolSpec] | None = None,
+        response_format: ResponseFormat | None = None,
     ) -> AssistantTurn:
         ...
 

@@ -9,6 +9,10 @@ DEFAULT_BASE_URL = "http://localhost:1234/v1"
 DEFAULT_MODEL = "openai/gpt-oss-20b"
 DEFAULT_PROVIDER = "openai_compatible"
 
+DEFAULT_MEMORY_DB_PATH = "~/.local/share/dev-helper-bot/memory.db"
+"""VM-локальный диск сандбокса, не workspace-маунт (design D2): SQLite
+поверх сетевой ФС нестабилен из-за локов/WAL."""
+
 
 def make_llm() -> LLMClient:
     provider = os.getenv("LLM_PROVIDER", DEFAULT_PROVIDER)
@@ -37,3 +41,8 @@ def telegram_token() -> str:
             "Copy .env.example to .env and fill in the token from @BotFather."
         )
     return token
+
+
+def memory_db_path() -> str:
+    """Путь к файлу БД переписки; переопределяется MEMORY_DB_PATH (design D2)."""
+    return os.getenv("MEMORY_DB_PATH", DEFAULT_MEMORY_DB_PATH)

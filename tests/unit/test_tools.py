@@ -1,18 +1,25 @@
 from __future__ import annotations
 
-import time
-
 from dev_helper_bot.tools import (
     HEAD_CHARS,
+    LIST_TOOL_NAME,
+    LIST_TOOL_SPEC,
     OUTPUT_LIMIT,
     TAIL_CHARS,
+    ExecResult,
     exec_command,
     truncate_output,
 )
 
+from tests.conftest import BrokenExecutor, FakeCommandExecutor
+
 
 async def test_exec_successful_command_returns_stdout_and_zero_exit():
-    result = await exec_command("echo hello")
+    fake = FakeCommandExecutor(
+        scripted={"echo hello": ExecResult(exit_code=0, stdout="hello\n", stderr="")}
+    )
+
+    result = await exec_command(fake, "echo hello")
 
     assert "exit_code: 0" in result
     assert "hello" in result
@@ -20,14 +27,26 @@ async def test_exec_successful_command_returns_stdout_and_zero_exit():
 
 
 async def test_exec_nonzero_exit_returns_stderr_and_exit_code():
-    result = await exec_command("echo oops >&2; exit 3")
+    fake = FakeCommandExecutor(
+        scripted={
+            "echo oops >&2; exit 3": ExecResult(
+                exit_code=3, stdout="", stderr="oops\n"
+            )
+        }
+    )
+
+    result = await exec_command(fake, "echo oops >&2; exit 3")
 
     assert "exit_code: 3" in result
     assert "oops" in result
 
 
 async def test_exec_long_output_is_truncated_head_and_tail():
-    result = await exec_command("yes | head -c 10000")
+    fake = FakeCommandExecutor(
+        default=ExecResult(exit_code=0, stdout="y\n" * 5000, stderr="")
+    )
+
+    result = await exec_command(fake, "yes | head -c 10000")
 
     assert len(result) < OUTPUT_LIMIT + 100
     assert "обрезано" in result
@@ -36,14 +55,22 @@ async def test_exec_long_output_is_truncated_head_and_tail():
     assert "y\ny" in result
 
 
-async def test_exec_timeout_kills_process_and_reports():
-    start = time.monotonic()
+async def test_exec_timeout_reports_marker_and_exit_code():
+    fake = FakeCommandExecutor(
+        default=ExecResult(exit_code=124, stdout="", stderr="", timed_out=True)
+    )
 
-    result = await exec_command("sleep 5", timeout=0.2)
+    result = await exec_command(fake, "sleep 5", timeout=0.2)
 
-    elapsed = time.monotonic() - start
-    assert elapsed < 3
     assert "Таймаут 0.2с" in result
+    assert "exit_code: 124" in result
+
+
+async def test_exec_infrastructure_error_returned_as_text_not_raised():
+    result = await exec_command(BrokenExecutor(), "echo hi")
+
+    assert "Не удалось выполнить команду" in result
+    assert "docker daemon is down" in result
 
 
 def test_truncate_output_keeps_short_text_intact():
@@ -60,3 +87,11 @@ def test_truncate_output_cuts_middle_with_marker():
     assert truncated.startswith("a" * HEAD_CHARS)
     assert truncated.endswith("B" * TAIL_CHARS)
     assert "обрезано 1000 символов" in truncated
+
+
+def test_list_tool_spec_declares_no_parameters():
+    function = LIST_TOOL_SPEC["function"]
+
+    assert function["name"] == LIST_TOOL_NAME == "list_sessions"
+    assert function["parameters"] == {"type": "object", "properties": {}}
+    assert not (function["parameters"].get("required") or [])
