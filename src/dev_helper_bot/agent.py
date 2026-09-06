@@ -15,10 +15,12 @@ from dev_helper_bot.tools import (
     EXEC_INFRA_ERROR_PREFIX,
     EXEC_TOOL_NAME,
     LIST_TOOL_NAME,
+    READ_FILE_TOOL_NAME,
     SEARCH_TOOL_NAME,
     CommandExecutor,
     HistorySearcher,
     exec_command,
+    read_file,
 )
 
 if TYPE_CHECKING:
@@ -27,6 +29,49 @@ if TYPE_CHECKING:
 log = logging.getLogger(__name__)
 
 MAX_LLM_STEPS = 8
+
+TOOL_OUTPUT_BUDGET_CHARS = 8000
+"""Символьный бюджет на суммарное содержимое tool-сообщений прогона
+(design D2): сворачивает только аномально разросшиеся прогоны."""
+
+COMPACTED_TOOL_OUTPUT_PREFIX = "[компакция:"
+
+
+def compacted_tool_stub(size: int) -> str:
+    return (
+        f"[компакция: вывод обрезан, было {size} симв.; "
+        "вызови инструмент повторно при необходимости]"
+    )
+
+
+def compact_tool_outputs(
+    history: list[Message], budget: int = TOOL_OUTPUT_BUDGET_CHARS
+) -> None:
+    """Свёртка старейших tool-выводов при превышении бюджета (design D2).
+
+    Команда вызова не дублируется в заглушке: она остаётся в соседнем
+    assistant-сообщении с tool_calls, которое не компактируется.
+    user/assistant-сообщения не трогаются; уже свёрнутое и слишком
+    короткое (заглушка длиннее вывода) не сворачивается повторно.
+    """
+    total = sum(
+        len(m.get("content") or "")
+        for m in history
+        if m.get("role") == "tool"
+    )
+    for message in history:
+        if total <= budget:
+            break
+        if message.get("role") != "tool":
+            continue
+        content = message.get("content") or ""
+        if content.startswith(COMPACTED_TOOL_OUTPUT_PREFIX):
+            continue
+        stub = compacted_tool_stub(len(content))
+        if len(stub) >= len(content):
+            continue
+        message["content"] = stub
+        total -= len(content) - len(stub)
 
 STEPS_EXHAUSTED_MESSAGE = (
     "Не смог получить ответ за отведённое число шагов "
@@ -163,11 +208,23 @@ async def execute_tool_call(
             return await history_search.list_sessions(), True
         except Exception as exc:
             return f"Ошибка выполнения инструмента: {exc}", False
+    if call["name"] == READ_FILE_TOOL_NAME:
+        arguments = json.loads(call["arguments"] or "{}")
+        try:
+            result = await read_file(
+                executor,
+                arguments["path"],
+                arguments.get("offset"),
+                arguments.get("limit"),
+            )
+        except Exception as exc:
+            return f"Ошибка выполнения инструмента: {exc}", False
+        return result, not result.startswith(EXEC_INFRA_ERROR_PREFIX)
     if call["name"] != EXEC_TOOL_NAME:
         return (
             f"Ошибка: неизвестный инструмент {call['name']!r}. "
-            f"Доступны {EXEC_TOOL_NAME!r}, {SEARCH_TOOL_NAME!r} "
-            f"и {LIST_TOOL_NAME!r}.",
+            f"Доступны {EXEC_TOOL_NAME!r}, {READ_FILE_TOOL_NAME!r}, "
+            f"{SEARCH_TOOL_NAME!r} и {LIST_TOOL_NAME!r}.",
             False,
         )
     arguments = json.loads(call["arguments"] or "{}")
@@ -303,5 +360,8 @@ async def run_agent(
                     "content": result,
                 }
             )
+        # Бюджет tool-выводов прогона (design D2): новые результаты могут
+        # вывести сумму за бюджет — старейшие сворачиваются в заглушки.
+        compact_tool_outputs(history)
     await finalize(RUN_STATUS_STEPS_EXHAUSTED)
     return STEPS_EXHAUSTED_MESSAGE

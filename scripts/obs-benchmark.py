@@ -1,20 +1,27 @@
 #!/usr/bin/env python3
 """Benchmark-харнесс: воспроизводимая генерация телеметрии прогонов
-(change add-token-audit, design D3/D4/D5).
+(change add-token-audit, design D3/D4/D5; optimize-token-usage D6).
 
 Гоняет фиксированный набор сценариев напрямую через агентный цикл, мимо
-Telegram: тот же конвейер, что handle_text в main.py — system prompt из
-скиллов, своя MemoryStore, RunRecorder + ObservingClient, run_agent с
-SandboxExecutor. Отличие от handle_text только в отсутствии транспорта
-и chunking; телеметрия по форме неотличима от боевой.
+Telegram: тот же конвейер, что handle_text в main.py — сборка запроса тем же
+швом skills.build_request_messages, своя MemoryStore, RunRecorder +
+ObservingClient, run_agent с SandboxExecutor. Отличие от handle_text только
+в отсутствии транспорта и chunking; телеметрия по форме неотличима от боевой.
 
 Изоляция (design D4): телеметрия — отдельный файл (--db / BENCHMARK_DB_PATH,
 дефолт ~/.local/share/dev-helper-bot/benchmark.db), память — свой файл
 (--memory-db / BENCHMARK_MEMORY_DB_PATH). Боевые observability.db и
-memory.db не открываются вовсе. Метка прогонов — фиксированная константа
-ниже (OBS_LABEL сознательно не читается, чтобы env не «перекрашивал»
-бенчмарк). Файл памяти пересоздаётся на каждом запуске: сессии сценариев
-всегда стартуют с чистого контекста, прогоны телеметрии накапливаются.
+memory.db не открываются вовсе. Метка прогонов — параметр --label (по
+умолчанию прежняя константа `benchmark`; OBS_LABEL сознательно не читается,
+чтобы env не «перекрашивал» бенчмарк) — прогоны «до» и «после» оптимизаций
+разделяются фильтром метки в одной БД. Файл памяти пересоздаётся на каждом
+запуске: сессии сценариев всегда стартуют с чистого контекста, прогоны
+телеметрии накапливаются.
+
+Автопроверки (design D6): финальные ответы сценариев проверяются по
+заявленным критериям (число в ответе, сущности раннего шага, суть бага
+фикстуры); результат выводится по завершении шага, провал маркируется
+отдельно от статуса прогона в телеметрии.
 
 Фикстура-проект (design D5) доставляется в /work/sample_project перед
 файловыми сценариями: служебный exec (гарантия контейнера-жильца),
@@ -26,6 +33,7 @@ rm -rf внутри и `docker cp` поверх — идемпотентност
 Запуск:
     python scripts/obs-benchmark.py                     # полный набор
     python scripts/obs-benchmark.py --only files        # только сценарий files
+    python scripts/obs-benchmark.py --label optimized   # метка прогонов
     python scripts/obs-benchmark.py --db /tmp/bm.db --memory-db /tmp/bm-mem.db
 """
 from __future__ import annotations
@@ -33,8 +41,9 @@ from __future__ import annotations
 import argparse
 import asyncio
 import os
+import re
 import sys
-from collections.abc import Iterable
+from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -58,7 +67,7 @@ from dev_helper_bot.sandbox import (  # noqa: E402
     SandboxExecutor,
     prepare_sandbox_environment,
 )
-from dev_helper_bot.skills import build_system_prompt, default_skills_dir, load_skills  # noqa: E402
+from dev_helper_bot.skills import build_request_messages, default_skills_dir, load_skills  # noqa: E402
 from dev_helper_bot.telemetry import (  # noqa: E402
     RUN_STATUS_LABELS,
     RUN_STATUS_LLM_ERROR,
@@ -69,11 +78,13 @@ from dev_helper_bot.telemetry import (  # noqa: E402
 from dev_helper_bot.tools import (  # noqa: E402
     EXEC_TOOL_SPEC,
     LIST_TOOL_SPEC,
+    READ_FILE_TOOL_SPEC,
     SEARCH_TOOL_SPEC,
 )
 
 BENCHMARK_LABEL = "benchmark"
-"""Фиксированная метка прогонов харнесса (design D4): аудит фильтрует по ней."""
+"""Метка прогонов харнесса по умолчанию (design D4/D6): переопределяется
+--label для разделения «до»/«после» оптимизаций в одной БД телеметрии."""
 
 DEFAULT_DB_PATH = "~/.local/share/dev-helper-bot/benchmark.db"
 DEFAULT_MEMORY_DB_PATH = "~/.local/share/dev-helper-bot/benchmark-memory.db"
@@ -81,7 +92,12 @@ DEFAULT_MEMORY_DB_PATH = "~/.local/share/dev-helper-bot/benchmark-memory.db"
 FIXTURE_HOST_DIR = Path(__file__).resolve().parent / "fixtures" / "sample_project"
 FIXTURE_SANDBOX_PATH = "/work/sample_project"
 
-AGENT_TOOLS = [EXEC_TOOL_SPEC, SEARCH_TOOL_SPEC, LIST_TOOL_SPEC]
+AGENT_TOOLS = [
+    EXEC_TOOL_SPEC,
+    READ_FILE_TOOL_SPEC,
+    SEARCH_TOOL_SPEC,
+    LIST_TOOL_SPEC,
+]
 
 CLOSE_SESSION = "close"
 """Маркер шага сценария: закрыть сессию памяти (аналог команды /new)."""
@@ -98,6 +114,57 @@ class Scenario:
     description: str
     steps: tuple[str, ...]
     needs_fixture: bool = False
+    checks: tuple[tuple[int, "StepCheck"], ...] = ()
+
+
+@dataclass(frozen=True)
+class StepCheck:
+    """Автопроверка финального ответа шага (design D6, спека benchmark-harness).
+
+    Провал проверки не меняет статус прогона в телеметрии: проверка —
+    отдельная маркировка в выводе харнесса.
+    """
+
+    description: str
+    verify: Callable[[Harness, str], Awaitable[bool]]
+
+
+VERBOSE_EXPECTED_SUM = 4_501_500
+"""Сумма чисел seq 1 3000: 3000·3001/2 — ожидание сценария verbose."""
+
+_NUMBER_SEPARATOR = "[ \u00a0\u202f,.']*"
+_WORD = re.compile(r"[A-Za-zА-Яа-яЁё]{2,}")
+
+
+def number_in_text(text: str, number: int) -> bool:
+    """Ожидаемое число в ответе с любым форматированием разрядов."""
+    pattern = _NUMBER_SEPARATOR.join(str(number))
+    return re.search(pattern, text) is not None
+
+
+async def check_verbose_sum(harness: Harness, reply: str) -> bool:
+    return number_in_text(reply, VERBOSE_EXPECTED_SUM)
+
+
+async def check_multiturn_languages(harness: Harness, reply: str) -> bool:
+    """Три языка шага 1: эталон — первые три строки notes.md (шаг 2 только
+    дописал четвёртую), проверяется упоминание каждого в ответе шага 3."""
+    result = await harness.executor.execute("head -n 3 notes.md")
+    if result.exit_code != 0:
+        return False
+    lines = [line for line in result.stdout.splitlines() if line.strip()]
+    if len(lines) < 3:
+        return False
+    answer = reply.lower()
+    return all(
+        any(word.lower() in answer for word in _WORD.findall(line))
+        for line in lines[:3]
+    )
+
+
+async def check_files_bug(harness: Harness, reply: str) -> bool:
+    """Суть бага фикстуры: скидка не применяется в calculate_total."""
+    return "скидк" in reply.lower()
 
 
 @dataclass
@@ -109,19 +176,24 @@ class Harness:
     telemetry: TelemetryStore
     executor: SandboxExecutor
     skills: dict[str, str] = field(default_factory=dict)
+    label: str = BENCHMARK_LABEL
 
     async def process_message(self, chat_id: int, text: str) -> str:
-        """Один прогон = одно сообщение, конвейер handle_text без Telegram."""
-        system_prompt = build_system_prompt(self.skills, datetime.now())
-        history: list[Message] = [{"role": "system", "content": system_prompt}]
-        history += await self.memory.load_open_history(chat_id)
+        """Один прогон = одно сообщение, конвейер handle_text без Telegram.
+
+        Сборка запроса — тот же шов skills.build_request_messages, что и в
+        handle_text (design D4): дублирования текста промпта в харнессе нет.
+        """
+        session_history = await self.memory.load_open_history(chat_id)
+        history: list[Message] = build_request_messages(
+            self.skills, session_history, text, datetime.now()
+        )
         await self.memory.append_user(chat_id, text)
-        history.append({"role": "user", "content": text})
 
         recorder = RunRecorder(
             self.telemetry,
             chat_id,
-            BENCHMARK_LABEL,
+            self.label,
             price_input_per_m=obs_price_input_per_m(),
             price_output_per_m=obs_price_output_per_m(),
         )
@@ -152,6 +224,12 @@ SCENARIOS: tuple[Scenario, ...] = (
         chat_id=101,
         description="Файловая задача: изучить проект, найти функцию, запустить тесты",
         needs_fixture=True,
+        checks=(
+            (0, StepCheck(
+                description="упоминание бага: скидка не применяется",
+                verify=check_files_bug,
+            )),
+        ),
         steps=(
             "В песочнице есть учебный проект sample_project (каталог "
             "/work/sample_project). Изучи его структуру, найди функцию "
@@ -164,6 +242,12 @@ SCENARIOS: tuple[Scenario, ...] = (
         name="verbose",
         chat_id=102,
         description="Команда с объёмным выводом: seq 1 3000",
+        checks=(
+            (0, StepCheck(
+                description=f"в ответе сумма {VERBOSE_EXPECTED_SUM:,}".replace(",", " "),
+                verify=check_verbose_sum,
+            )),
+        ),
         steps=(
             "Выполни в песочнице команду seq 1 3000 (вывод будет большим) и "
             "посчитай сумму выведенных чисел отдельной командой. Ответь "
@@ -187,6 +271,12 @@ SCENARIOS: tuple[Scenario, ...] = (
         name="multiturn",
         chat_id=104,
         description="Многоходовая сессия: 3 сообщения в одной сессии памяти",
+        checks=(
+            (2, StepCheck(
+                description="в ответе шага 3 — три языка шага 1 (по notes.md)",
+                verify=check_multiturn_languages,
+            )),
+        ),
         steps=(
             "Будем вести заметки по шагам. Шаг 1: создай в песочнице файл "
             "notes.md с нумерованным списком трёх языков программирования.",
@@ -252,10 +342,20 @@ async def deploy_fixture(executor: SandboxExecutor) -> None:
         )
 
 
-async def run_scenario(scenario: Scenario, harness: Harness) -> list[str]:
-    """Исполняет шаги сценария; возвращает статусы созданных прогонов."""
+async def run_scenario(
+    scenario: Scenario, harness: Harness
+) -> tuple[list[str], int, int]:
+    """Исполняет шаги сценария с автопроверками ответов (design D6).
+
+    Возвращает (статусы созданных прогонов, проверки пройдены, проверки
+    провалены): провал проверки — отдельная маркировка, статус прогона
+    в телеметрии отражает завершение цикла агента, а не проверку.
+    """
     statuses: list[str] = []
-    for step in scenario.steps:
+    checks_passed = 0
+    checks_failed = 0
+    checks_by_step = dict(scenario.checks)
+    for index, step in enumerate(scenario.steps):
         if step == CLOSE_SESSION:
             await harness.memory.close_session(scenario.chat_id)
             print(f"    сессия чата {scenario.chat_id} закрыта (аналог /new)")
@@ -265,7 +365,20 @@ async def run_scenario(scenario: Scenario, harness: Harness) -> list[str]:
         statuses.append(status)
         print(f"    прогон завершён: {RUN_STATUS_LABELS.get(status, status)}")
         print(f"    ответ: {_preview(reply)}")
-    return statuses
+        check = checks_by_step.get(index)
+        if check is not None:
+            try:
+                passed = await check.verify(harness, reply)
+            except Exception as exc:
+                print(f"    проверка ({check.description}): ошибка — {exc}")
+                passed = False
+            if passed:
+                checks_passed += 1
+                print(f"    проверка ({check.description}): пройдена")
+            else:
+                checks_failed += 1
+                print(f"    проверка ({check.description}): ✗ ПРОВАЛЕНА")
+    return statuses, checks_passed, checks_failed
 
 
 async def _last_run_status(store: TelemetryStore) -> str | None:
@@ -328,8 +441,10 @@ async def run(args: argparse.Namespace) -> int:
         await memory.close()
         raise BenchmarkError(f"Не удалось открыть БД телеметрии {db_path}: {exc}") from exc
 
-    print(f"Бенчмарк: БД телеметрии {db_path}, метка {BENCHMARK_LABEL!r}")
+    print(f"Бенчмарк: БД телеметрии {db_path}, метка {args.label!r}")
     total_runs = 0
+    total_checks_passed = 0
+    total_checks_failed = 0
     try:
         if any(s.needs_fixture for s in scenarios):
             print("Доставка фикстуры sample_project в песочницу…")
@@ -341,25 +456,31 @@ async def run(args: argparse.Namespace) -> int:
             telemetry=telemetry,
             executor=executor,
             skills=load_skills(default_skills_dir()),
+            label=args.label,
         )
         for scenario in scenarios:
             print(f"\nСценарий {scenario.name} (чат {scenario.chat_id}): "
                   f"{scenario.description}")
-            statuses = await run_scenario(scenario, harness)
+            statuses, passed, failed = await run_scenario(scenario, harness)
             total_runs += len(statuses)
+            total_checks_passed += passed
+            total_checks_failed += failed
     finally:
         await executor.stop()
         await memory.close()
         await telemetry.close()
 
     print(f"\nГотово: прогонов создано {total_runs}, БД {db_path}, "
-          f"метка {BENCHMARK_LABEL!r}.")
+          f"метка {args.label!r}.")
+    print(f"Автопроверки: {total_checks_passed} пройдено, "
+          f"{total_checks_failed} провалено"
+          + ("  ✗ ЕСТЬ ПРОВАЛЕННЫЕ ПРОВЕРКИ" if total_checks_failed else ""))
     print(f"Отчёт: python scripts/obs-audit.py --db {db_path} "
-          f"--label {BENCHMARK_LABEL}")
+          f"--label {args.label}")
     return 0
 
 
-def main(argv: Iterable[str] | None = None) -> int:
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Генерация телеметрии benchmark-прогонов агента "
                     "(прямой прогон сценариев, мимо Telegram)."
@@ -368,10 +489,17 @@ def main(argv: Iterable[str] | None = None) -> int:
                                      "(по умолчанию BENCHMARK_DB_PATH)")
     parser.add_argument("--memory-db", help="файл БД памяти бенчмарка "
                                             "(по умолчанию BENCHMARK_MEMORY_DB_PATH)")
+    parser.add_argument("--label", default=BENCHMARK_LABEL,
+                        help=f"метка прогонов в телеметрии "
+                             f"(по умолчанию {BENCHMARK_LABEL!r})")
     parser.add_argument("--only", action="append", default=[],
                         help="исполнить только сценарий с этим именем "
                              "(можно несколько раз)")
-    args = parser.parse_args(list(argv) if argv is not None else None)
+    return parser
+
+
+def main(argv: Iterable[str] | None = None) -> int:
+    args = build_parser().parse_args(list(argv) if argv is not None else None)
 
     try:
         return asyncio.run(run(args))

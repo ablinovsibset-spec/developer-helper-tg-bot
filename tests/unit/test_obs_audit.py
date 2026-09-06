@@ -25,23 +25,31 @@ def _load_audit():
 audit = _load_audit()
 
 
-def usage(input_tokens, output_tokens=4) -> dict:
+def usage(input_tokens, output_tokens=4, cached_tokens=None) -> dict:
     return {
         "input_tokens": input_tokens,
         "output_tokens": output_tokens,
-        "cached_tokens": None,
+        "cached_tokens": cached_tokens,
         "reasoning_tokens": None,
-        "raw": {"prompt_tokens": input_tokens, "completion_tokens": output_tokens},
+        "raw": {
+            "prompt_tokens": input_tokens,
+            "completion_tokens": output_tokens,
+            "prompt_tokens_details": (
+                {"cached_tokens": cached_tokens}
+                if cached_tokens is not None
+                else None
+            ),
+        },
     }
 
 
-async def _llm(recorder, turn, input_tokens, roles, ok=True):
+async def _llm(recorder, turn, input_tokens, roles, ok=True, cached_tokens=None):
     await recorder.record_llm_call(
         turn_number=turn,
         model="m",
         latency_ms=10.0 * turn,
         ok=ok,
-        usage=usage(input_tokens) if ok else None,
+        usage=usage(input_tokens, cached_tokens=cached_tokens) if ok else None,
         messages_count=turn + 1,
         prompt_chars=100 * turn,
         prompt_roles=roles,
@@ -233,8 +241,93 @@ async def test_q4_no_inputs_reports_no_data(seeded_db):
     finally:
         conn.close()
 
-    q4 = out.split("Q4.")[1]
+    q4 = out.split("Q4.")[1].split("Q5.")[0]
     assert "Нет прогонов с входными токенами" in q4
+
+
+# --- Q5: стоимость с кэш-скидкой (task 6.2) ---
+
+
+def q5(out: str) -> str:
+    return out.split("Q5.")[1]
+
+
+async def test_q5_without_cache_data_effective_equals_raw_with_marker(seeded_db):
+    out = render(seeded_db)
+
+    section = q5(out)
+    raw = re.search(r"Сырая стоимость:\s+\$([\d.]+)", section)
+    effective = re.search(r"Эффективная стоимость:\s+\$([\d.]+)", section)
+    assert raw and effective
+    assert raw.group(1) == effective.group(1)  # равна сырой
+    assert "данных о кэше нет" in section
+    assert "Экономия кэша" not in section
+
+
+async def test_q5_with_cache_data_shows_both_costs(tmp_path):
+    db_path = tmp_path / "obs.db"
+    store = TelemetryStore(db_path)
+    await store.open()
+    try:
+        run = RunRecorder(store, 1, "bench")
+        await run.start()
+        await _llm(run, 1, 1000, {"system": 100}, cached_tokens=600)
+        await run.finish("success")
+    finally:
+        await store.close()
+
+    out = render(db_path, label="bench")
+
+    section = q5(out)
+    # raw = 1000×0.11 + 4×0.60 = $0.0001124/1M-масштаб… считаем точно:
+    raw = (1000 * 0.11 + 4 * 0.60) / 1_000_000
+    effective = (400 * 0.11 + 600 * 0.0275 + 4 * 0.60) / 1_000_000
+    assert f"${raw:.6f}" in section
+    assert f"${effective:.6f}" in section
+    assert "кэшировано 60.0% входных" in section
+    assert f"Экономия кэша:         ${raw - effective:.6f}" in section
+
+
+async def test_q5_multiplier_is_configurable(tmp_path):
+    db_path = tmp_path / "obs.db"
+    store = TelemetryStore(db_path)
+    await store.open()
+    try:
+        run = RunRecorder(store, 1, "bench")
+        await run.start()
+        await _llm(run, 1, 1000, None, cached_tokens=1000)
+        await run.finish("success")
+    finally:
+        await store.close()
+
+    conn = sqlite3.connect(db_path)
+    try:
+        out = audit.render_audit(
+            conn, "bench", None, cached_price_multiplier=0.5
+        )
+    finally:
+        conn.close()
+
+    section = q5(out)
+    # Полностью кэшированный ввод при 0.5×: эффективная вдвое дешевле сырой
+    raw = (1000 * 0.11 + 4 * 0.60) / 1_000_000
+    effective = (1000 * 0.055 + 4 * 0.60) / 1_000_000
+    assert f"${effective:.6f}" in section
+    assert f"${raw:.6f}" in section
+    assert "0.5× входного" in section
+
+
+async def test_q5_no_inputs_reports_no_data(seeded_db):
+    db_path = seeded_db
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute("UPDATE llm_calls SET input_tokens = NULL")
+        conn.commit()
+        out = audit.render_audit(conn, None, None)
+    finally:
+        conn.close()
+
+    assert "Нет LLM-вызовов с входными токенами" in q5(out)
 
 
 # --- Фильтры и CLI-поведение ---
@@ -281,8 +374,28 @@ async def test_main_prints_all_sections(seeded_db, capsys):
 
     out = capsys.readouterr().out
     assert code == 0
-    for section in ("Q1.", "Q2.", "Q3.", "Q4."):
+    for section in ("Q1.", "Q2.", "Q3.", "Q4.", "Q5."):
         assert section in out
+
+
+async def test_main_cached_price_multiplier_flag(tmp_path, capsys):
+    db_path = tmp_path / "obs.db"
+    store = TelemetryStore(db_path)
+    await store.open()
+    try:
+        run = RunRecorder(store, 1, "bench")
+        await run.start()
+        await _llm(run, 1, 100, None, cached_tokens=50)
+        await run.finish("success")
+    finally:
+        await store.close()
+
+    code = audit.main(["--db", str(db_path), "--label", "bench",
+                       "--cached-price-multiplier", "0.1"])
+
+    out = capsys.readouterr().out
+    assert code == 0
+    assert "0.1× входного" in q5(out)
 
 
 def test_bar_and_human_count():

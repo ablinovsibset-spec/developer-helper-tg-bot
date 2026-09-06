@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
-"""Аудит потребления токенов по БД телеметрии (change add-token-audit).
+"""Аудит потребления токенов по БД телеметрии (change add-token-audit,
+optimize-token-usage D5).
 
 Отвечает на четыре вопроса Части 2 задачи observability (design D6/D7/D8),
-формируя baseline для оптимизаций:
+формируя baseline для оптимизаций, и добавляет стоимость с кэш-скидкой:
 
   Q1  Топ инструментов      — оценочные токены вывода по tool_name
   Q2  Самый дорогой ход     — распределение input_tokens по turn_number
   Q3  Рост типов контекста  — доли типов по разбивке prompt_roles
   Q4  Повторные токены      — ре-отправки внутри прогона + межпрогонный слой
+  Q5  Стоимость             — сырая и эффективная (кэш-скидка cached_tokens)
 
 Как obs-dashboard.py: самодостаточный stdlib-скрипт (sqlite3), читает БД
 без запуска бота. У dashborada другая роль (агрегаты и timeline) — аудит
@@ -17,11 +19,15 @@
     python scripts/obs-audit.py                              # дефолтная БД
     python scripts/obs-audit.py --db ~/.local/share/dev-helper-bot/benchmark.db
     python scripts/obs-audit.py --label benchmark --since 2026-09-01
+    python scripts/obs-audit.py --cached-price-multiplier 0.5
 
 Пустая база и отсутствие файла — понятные сообщения, не трейсбек.
 Записи без prompt_roles (созданные до миграции) не подставляются нулями:
 секция Q3 честно сообщает о недоступности. Оценки chars/4 (как и в
 телеметрии tool-вызовов) помечаются в выводе.
+
+Цель −30% стоимости (задача observability, часть 3) считается по сырым
+входным токенам (Q4); кэш-скидка в Q5 приводится справочно.
 """
 from __future__ import annotations
 
@@ -33,6 +39,12 @@ import sys
 from collections.abc import Iterable
 
 DEFAULT_OBS_DB_PATH = "~/.local/share/dev-helper-bot/observability.db"
+
+DEFAULT_PRICE_INPUT_PER_M = 0.11
+DEFAULT_PRICE_OUTPUT_PER_M = 0.60
+DEFAULT_CACHED_PRICE_MULTIPLIER = 0.25
+"""Дефолты виртуального прайса — те же, что у config.py бота; кэшированные
+токены по отдельному прайсу (design D5): 0.25 × входного."""
 
 CHARS_PER_TOKEN = 4
 """Та же оценка, что estimate_tool_tokens в телеметрии (design D7)."""
@@ -90,12 +102,13 @@ def load_llm_calls(conn: sqlite3.Connection, run_ids: list[int]) -> list[dict]:
         return []
     placeholders = ",".join("?" * len(run_ids))
     sql = (
-        f"SELECT run_id, turn_number, input_tokens, prompt_roles "
+        f"SELECT run_id, turn_number, input_tokens, output_tokens, "
+        f"cached_tokens, prompt_roles "
         f"FROM llm_calls WHERE run_id IN ({placeholders}) "
         f"ORDER BY run_id, turn_number, id"
     )
     calls = []
-    for run_id, turn, input_tokens, prompt_roles in conn.execute(sql, run_ids):
+    for run_id, turn, input_tokens, output_tokens, cached_tokens, prompt_roles in conn.execute(sql, run_ids):
         roles = None
         if prompt_roles is not None:
             try:
@@ -103,7 +116,10 @@ def load_llm_calls(conn: sqlite3.Connection, run_ids: list[int]) -> list[dict]:
             except ValueError:
                 roles = None  # битый JSON трактуется как отсутствие разбивки
         calls.append({"run_id": run_id, "turn": turn,
-                      "input_tokens": input_tokens, "roles": roles})
+                      "input_tokens": input_tokens,
+                      "output_tokens": output_tokens,
+                      "cached_tokens": cached_tokens,
+                      "roles": roles})
     return calls
 
 
@@ -361,11 +377,75 @@ def render_q4(calls: list[dict]) -> str:
     return "\n".join(lines)
 
 
+# --- Q5: стоимость с кэш-скидкой (design D5, спека token-audit) ---
+
+
+def render_q5(
+    calls: list[dict],
+    price_input_per_m: float,
+    price_output_per_m: float,
+    cached_price_multiplier: float,
+) -> str:
+    """Сырая стоимость (все входные по входному прайсу) рядом с эффективной
+    (cached_tokens по отдельному прайсу). Без кэш-данных эффективная равна
+    сырой с явной пометкой, а не маскировкой."""
+    lines = ["Q5. Стоимость: сырая и эффективная (кэш-скидка)", "─" * 60]
+    with_input = [c for c in calls if c["input_tokens"] is not None]
+    if not with_input:
+        lines.append("Нет LLM-вызовов с входными токенами под фильтрами — "
+                     "данных нет.")
+        return "\n".join(lines)
+
+    total_input = sum(c["input_tokens"] or 0 for c in calls)
+    total_output = sum(c["output_tokens"] or 0 for c in calls)
+    total_cached = sum(c["cached_tokens"] or 0 for c in calls)
+    has_cache_data = any(c["cached_tokens"] is not None for c in calls)
+
+    cached_price = price_input_per_m * cached_price_multiplier
+    raw_cost = (
+        total_input * price_input_per_m + total_output * price_output_per_m
+    ) / 1_000_000
+    effective_cost = (
+        (total_input - total_cached) * price_input_per_m
+        + total_cached * cached_price
+        + total_output * price_output_per_m
+    ) / 1_000_000
+
+    lines.append(
+        f"Сырая стоимость:       ${raw_cost:.6f}  "
+        f"(входные ${price_input_per_m:g}/1M, выходные ${price_output_per_m:g}/1M, "
+        f"все входные по полной цене)"
+    )
+    if has_cache_data:
+        share = total_cached / total_input * 100 if total_input else 0.0
+        lines.append(
+            f"Эффективная стоимость: ${effective_cost:.6f}  "
+            f"(кэшировано {share:.1f}% входных по ${cached_price:g}/1M = "
+            f"{cached_price_multiplier:g}× входного)"
+        )
+        lines.append(f"Экономия кэша:         ${raw_cost - effective_cost:.6f}")
+    else:
+        lines.append(
+            f"Эффективная стоимость: ${effective_cost:.6f}  — данных о кэше "
+            f"нет (cached_tokens не отдаётся поставщиком), равна сырой"
+        )
+    lines.append("Цель −30% считается по сырым входным токенам (Q4); "
+                 "кэш-скидка — справочно.")
+    return "\n".join(lines)
+
+
 # --- Сборка отчёта ---
 
 
-def render_audit(conn: sqlite3.Connection, label: str | None,
-                 since: str | None) -> str:
+def render_audit(
+    conn: sqlite3.Connection,
+    label: str | None,
+    since: str | None,
+    *,
+    price_input_per_m: float = DEFAULT_PRICE_INPUT_PER_M,
+    price_output_per_m: float = DEFAULT_PRICE_OUTPUT_PER_M,
+    cached_price_multiplier: float = DEFAULT_CACHED_PRICE_MULTIPLIER,
+) -> str:
     runs = load_runs(conn, label, since)
     if not runs:
         hint = " Проверьте фильтры --label/--since." if label or since else ""
@@ -391,6 +471,13 @@ def render_audit(conn: sqlite3.Connection, label: str | None,
             render_q3(llm_calls),
             "",
             render_q4(llm_calls),
+            "",
+            render_q5(
+                llm_calls,
+                price_input_per_m,
+                price_output_per_m,
+                cached_price_multiplier,
+            ),
         ]
     )
 
@@ -408,6 +495,19 @@ def main(argv: Iterable[str] | None = None) -> int:
     parser.add_argument("--db", help="путь к БД телеметрии (по умолчанию OBS_DB_PATH)")
     parser.add_argument("--label", help="фильтр прогонов по метке")
     parser.add_argument("--since", help="прогоны, начатые с даты (ISO, напр. 2026-09-01)")
+    parser.add_argument("--price-input-per-m", type=float,
+                        default=DEFAULT_PRICE_INPUT_PER_M,
+                        help=f"цена входных токенов $/1M для расчёта стоимостей "
+                             f"(по умолчанию {DEFAULT_PRICE_INPUT_PER_M})")
+    parser.add_argument("--price-output-per-m", type=float,
+                        default=DEFAULT_PRICE_OUTPUT_PER_M,
+                        help=f"цена выходных токенов $/1M "
+                             f"(по умолчанию {DEFAULT_PRICE_OUTPUT_PER_M})")
+    parser.add_argument("--cached-price-multiplier", type=float,
+                        default=DEFAULT_CACHED_PRICE_MULTIPLIER,
+                        help="доля входной цены для кэшированных токенов "
+                             "в эффективной стоимости "
+                             f"(по умолчанию {DEFAULT_CACHED_PRICE_MULTIPLIER})")
     args = parser.parse_args(list(argv) if argv is not None else None)
 
     db_path = resolve_db_path(args.db)
@@ -419,7 +519,14 @@ def main(argv: Iterable[str] | None = None) -> int:
 
     conn = sqlite3.connect(db_path)
     try:
-        print(render_audit(conn, args.label, args.since))
+        print(render_audit(
+            conn,
+            args.label,
+            args.since,
+            price_input_per_m=args.price_input_per_m,
+            price_output_per_m=args.price_output_per_m,
+            cached_price_multiplier=args.cached_price_multiplier,
+        ))
     except sqlite3.Error as exc:
         print(f"Не удалось прочитать БД телеметрии ({db_path}): {exc}")
         return 1

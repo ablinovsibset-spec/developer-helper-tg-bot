@@ -25,7 +25,7 @@ from dev_helper_bot.config import (
 from dev_helper_bot.llm import LLMClient, LLMUnavailable, Message
 from dev_helper_bot.memory import ChatHistorySearcher, MemoryStore
 from dev_helper_bot.sandbox import SandboxExecutor, prepare_sandbox_environment
-from dev_helper_bot.skills import build_system_prompt, default_skills_dir, load_skills
+from dev_helper_bot.skills import build_request_messages, default_skills_dir, load_skills
 from dev_helper_bot.telemetry import (
     RUN_STATUS_LLM_ERROR,
     ObservingClient,
@@ -35,6 +35,7 @@ from dev_helper_bot.telemetry import (
 from dev_helper_bot.tools import (
     EXEC_TOOL_SPEC,
     LIST_TOOL_SPEC,
+    READ_FILE_TOOL_SPEC,
     SEARCH_TOOL_SPEC,
     CommandExecutor,
 )
@@ -43,7 +44,12 @@ TELEGRAM_MESSAGE_LIMIT = 4096
 WAITING_MESSAGE = "⏳ Готовлю ответ…"
 NEW_CHAT_CONFIRMATION = "🆕 Контекст сброшен — начинаем новый диалог."
 
-AGENT_TOOLS = [EXEC_TOOL_SPEC, SEARCH_TOOL_SPEC, LIST_TOOL_SPEC]
+AGENT_TOOLS = [
+    EXEC_TOOL_SPEC,
+    READ_FILE_TOOL_SPEC,
+    SEARCH_TOOL_SPEC,
+    LIST_TOOL_SPEC,
+]
 
 logging.basicConfig(
     level=logging.INFO,
@@ -71,11 +77,14 @@ async def handle_text(
     user_text = message.text or ""
     # Канон — БД (design D4): контекст открытой сессии восстанавливается из
     # хранилища, транскрипт инструментов живёт только в рамках этой обработки.
-    system_prompt = build_system_prompt(skills, datetime.now())
-    history: list[Message] = [{"role": "system", "content": system_prompt}]
-    history += await memory.load_open_history(chat_id)
+    # Сборка запроса — единый шов skills.build_request_messages (design D4):
+    # стабильный системный промпт + история + текущее сообщение с контекстной
+    # строкой времени (в память не персистится).
+    session_history = await memory.load_open_history(chat_id)
+    history: list[Message] = build_request_messages(
+        skills, session_history, user_text, datetime.now()
+    )
     await memory.append_user(chat_id, user_text)
-    history.append({"role": "user", "content": user_text})
 
     # Телеметрия прогона (design D2): recorder на каждое сообщение, LLM —
     # в наблюдающей обёртке. Телеметрия best-effort и не влияет на ответы.

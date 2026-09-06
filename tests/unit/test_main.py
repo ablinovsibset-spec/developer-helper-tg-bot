@@ -33,18 +33,19 @@ CHAT_ID = 42
 SKILLS = {"wttr-in-api": "Правила wttr.in"}
 T1 = datetime(2026, 8, 28, 7, 45)
 T2 = datetime(2026, 8, 28, 7, 47)
-SYSTEM_AT_T1 = (
-    "Reasoning: medium\nТекущие дата и время: 2026-08-28 07:45 (пятница)"
+SYSTEM = (
+    "Reasoning: medium"
     f"\n{SANDBOX_ENV_LINE}"
     f"\n{MEMORY_ENV_LINE}"
     "\n\n## wttr-in-api\nПравила wttr.in"
 )
-SYSTEM_AT_T2 = (
-    "Reasoning: medium\nТекущие дата и время: 2026-08-28 07:47 (пятница)"
-    f"\n{SANDBOX_ENV_LINE}"
-    f"\n{MEMORY_ENV_LINE}"
-    "\n\n## wttr-in-api\nПравила wttr.in"
-)
+TIME_AT_T1 = "Текущие дата и время: 2026-08-28 07:45 (пятница)"
+TIME_AT_T2 = "Текущие дата и время: 2026-08-28 07:47 (пятница)"
+
+
+def user_at(moment: str, text: str) -> dict:
+    """Текущее user-сообщение с контекстной строкой времени (design D3)."""
+    return {"role": "user", "content": f"{moment}\n{text}"}
 
 
 def fake_datetime(*times: datetime):
@@ -100,8 +101,8 @@ async def test_handle_text_prompt_goes_to_llm_with_system_and_tools(
     await handle(FakeMessage("привет", chat_id=CHAT_ID), fake_bot, llm, store)
 
     assert llm.requests[0] == [
-        {"role": "system", "content": SYSTEM_AT_T1},
-        {"role": "user", "content": "привет"},
+        {"role": "system", "content": SYSTEM},
+        user_at(TIME_AT_T1, "привет"),
     ]
     assert llm.tools_per_request == [AGENT_TOOLS]
 
@@ -130,17 +131,20 @@ async def test_context_is_kept_between_messages(fake_bot, store, monkeypatch):
     llm.turns = [assistant_turn("второй ответ")]
     await handle(FakeMessage("второе", chat_id=CHAT_ID), fake_bot, llm, store)
 
+    # История из памяти — без строк времени; строка только в текущем сообщении
     assert llm.requests[1] == [
-        {"role": "system", "content": SYSTEM_AT_T2},
+        {"role": "system", "content": SYSTEM},
         {"role": "user", "content": "первое"},
         {"role": "assistant", "content": "первый ответ"},
-        {"role": "user", "content": "второе"},
+        user_at(TIME_AT_T2, "второе"),
     ]
 
 
-async def test_system_message_is_refreshed_between_messages(
+async def test_datetime_line_refreshed_and_prefix_stable_between_messages(
     fake_bot, store, monkeypatch
 ):
+    """Строка времени обновляется на каждом сообщении (design D3), а префикс
+    system+история остаётся байтово стабильным (спека skills)."""
     llm = make_llm_stub(reply="первый ответ")
     monkeypatch.setattr(main_module, "datetime", fake_datetime(T1, T2))
     await handle(
@@ -150,14 +154,35 @@ async def test_system_message_is_refreshed_between_messages(
     llm.turns = [assistant_turn("второй ответ")]
     await handle(FakeMessage("второе", chat_id=CHAT_ID), fake_bot, llm, store)
 
-    assert llm.requests[0][0] == {"role": "system", "content": SYSTEM_AT_T1}
-    assert llm.requests[1][0] == {"role": "system", "content": SYSTEM_AT_T2}
-    assert [m["role"] for m in llm.requests[1]] == [
-        "system",
-        "user",
-        "assistant",
-        "user",
-    ]
+    first, second = llm.requests[0], llm.requests[1]
+    assert TIME_AT_T1 in first[1]["content"]
+    assert TIME_AT_T2 in second[3]["content"]
+    # Префикс второго запроса = system + загруженная история — байтово тот же
+    assert second[0] == first[0] == {"role": "system", "content": SYSTEM}
+    assert "Текущие дата и время" not in second[1]["content"]
+
+
+async def test_prefix_stable_within_agent_run(fake_bot, store, monkeypatch):
+    """Прогоны цикла начинают каждый следующий запрос тем же префиксом,
+    дополненным новыми сообщениями (спека skills)."""
+    monkeypatch.setattr(main_module, "datetime", fake_datetime(T1))
+    llm = make_scripted_llm(
+        [
+            assistant_turn(
+                content=None,
+                tool_calls=[tool_call(arguments='{"command": "echo hi"}')],
+                finish_reason="tool_calls",
+            ),
+            assistant_turn(content="готово"),
+        ]
+    )
+
+    await handle(FakeMessage("запрос", chat_id=CHAT_ID), fake_bot, llm, store)
+
+    assert len(llm.requests) == 2
+    first, second = llm.requests
+    assert second[: len(first)] == first
+    assert [m["role"] for m in second[len(first):]] == ["assistant", "tool"]
 
 
 async def test_tool_transcript_in_flight_but_not_persisted(fake_bot, store):
@@ -221,10 +246,10 @@ async def test_context_survives_bot_restart(fake_bot, tmp_path, monkeypatch):
     await second_store.close()
 
     assert llm.requests[2] == [
-        {"role": "system", "content": SYSTEM_AT_T2},
+        {"role": "system", "content": SYSTEM},
         {"role": "user", "content": "первое"},
         {"role": "assistant", "content": "первый ответ"},
-        {"role": "user", "content": "второе"},
+        user_at(TIME_AT_T2, "второе"),
     ]
     assert not any(
         m["role"] in ("tool",) or "tool_calls" in m
@@ -251,8 +276,8 @@ async def test_new_command_closes_session_without_llm_call(
     await handle(FakeMessage("второе", chat_id=CHAT_ID), fake_bot, llm, store)
 
     assert llm.requests[0] == [
-        {"role": "system", "content": SYSTEM_AT_T2},
-        {"role": "user", "content": "второе"},
+        {"role": "system", "content": SYSTEM},
+        user_at(TIME_AT_T2, "второе"),
     ]
     # Прошлая сессия осталась в хранилище и доступна поиску
     assert "первое" in await store.search_completed(CHAT_ID, "первое")
@@ -281,7 +306,7 @@ async def test_chats_are_isolated_in_handler(fake_bot, store, monkeypatch):
     await handle(FakeMessage("секрет б", chat_id=2), fake_bot, llm, store)
 
     assert [m["role"] for m in llm.requests[1]] == ["system", "user"]
-    assert llm.requests[1][1]["content"] == "секрет б"
+    assert "секрет б" in llm.requests[1][1]["content"]
     assert "секрет а" not in str(llm.requests[1])
 
 
