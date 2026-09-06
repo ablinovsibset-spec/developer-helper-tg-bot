@@ -25,8 +25,8 @@ def _load_audit():
 audit = _load_audit()
 
 
-def usage(input_tokens, output_tokens=4, cached_tokens=None) -> dict:
-    return {
+def usage(input_tokens, output_tokens=4, cached_tokens=None, billed_cost=None) -> dict:
+    u = {
         "input_tokens": input_tokens,
         "output_tokens": output_tokens,
         "cached_tokens": cached_tokens,
@@ -41,15 +41,24 @@ def usage(input_tokens, output_tokens=4, cached_tokens=None) -> dict:
             ),
         },
     }
+    if billed_cost is not None:
+        u["billed_cost"] = billed_cost
+        u["raw"]["cost"] = billed_cost
+    return u
 
 
-async def _llm(recorder, turn, input_tokens, roles, ok=True, cached_tokens=None):
+async def _llm(recorder, turn, input_tokens, roles, ok=True, cached_tokens=None,
+               billed_cost=None):
     await recorder.record_llm_call(
         turn_number=turn,
         model="m",
         latency_ms=10.0 * turn,
         ok=ok,
-        usage=usage(input_tokens, cached_tokens=cached_tokens) if ok else None,
+        usage=(
+            usage(input_tokens, cached_tokens=cached_tokens,
+                  billed_cost=billed_cost)
+            if ok else None
+        ),
         messages_count=turn + 1,
         prompt_chars=100 * turn,
         prompt_roles=roles,
@@ -328,6 +337,76 @@ async def test_q5_no_inputs_reports_no_data(seeded_db):
         conn.close()
 
     assert "Нет LLM-вызовов с входными токенами" in q5(out)
+
+
+# --- Q5: фактический биллинг поставщика (pin-routerai-flex, task 3.2) ---
+# Три сценараря спеки token-audit: billed есть; billed нет, кеш есть;
+# ни того ни другого.
+
+
+async def test_q5_billed_present_actual_cost_is_main_line(tmp_path):
+    """Сценарий «Фактическая стоимость доступна»: сумма billed_cost (₽) —
+    основной строкой, оценки по прайсу — следом с пометкой «оценка»."""
+    db_path = tmp_path / "obs.db"
+    store = TelemetryStore(db_path)
+    await store.open()
+    try:
+        run = RunRecorder(store, 1, "flex")
+        await run.start()
+        await _llm(run, 1, 1000, {"system": 100}, billed_cost=1.25,
+                   cached_tokens=600)
+        await _llm(run, 2, 500, {"system": 100}, billed_cost=0.75)
+        await run.finish("success")
+    finally:
+        await store.close()
+
+    out = render(db_path, label="flex")
+
+    section = q5(out)
+    # Основная строка — фактическая сумма (2.00 ₽), до строк оценок
+    assert "Фактический биллинг поставщика: 2.0000 ₽" in section
+    assert "сумма usage.cost по 2 вызовам" in section
+    # Оценки — следом, с явной пометкой
+    raw = (1500 * 0.11 + 8 * 0.60) / 1_000_000
+    assert section.index("Фактический биллинг") < section.index("Сырая оценка")
+    assert re.search(rf"Сырая оценка:\s+\${raw:.6f}", section)
+    assert "оценка: входные $0.11/1M" in section
+    assert "Эффективная оценка:" in section
+    # Прежние подписи основных строк больше не основа
+    assert "Сырая стоимость:" not in section
+
+
+async def test_q5_billed_absent_cache_present_keeps_estimate_behavior(tmp_path):
+    """Сценарий «Есть данные о кэше»: сырая и эффективная стоимости с долей
+    кэшированных токенов (LM Studio: billed_cost нет)."""
+    db_path = tmp_path / "obs.db"
+    store = TelemetryStore(db_path)
+    await store.open()
+    try:
+        run = RunRecorder(store, 1, "bench")
+        await run.start()
+        await _llm(run, 1, 1000, {"system": 100}, cached_tokens=600)
+        await run.finish("success")
+    finally:
+        await store.close()
+
+    out = render(db_path, label="bench")
+
+    section = q5(out)
+    assert "Фактический биллинг" not in section
+    assert "Сырая стоимость:" in section
+    assert "кэшировано 60.0% входных" in section
+    assert "Экономия кэша" in section
+
+
+async def test_q5_neither_billed_nor_cache_effective_equals_raw(seeded_db):
+    """Сценарий «Данных о кэше нет»: эффективная равна сырой с пометкой."""
+    out = render(seeded_db)
+
+    section = q5(out)
+    assert "Фактический биллинг" not in section
+    assert "данных о кэше нет" in section
+    assert "Экономия кэша" not in section
 
 
 # --- Фильтры и CLI-поведение ---

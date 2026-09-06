@@ -8,6 +8,7 @@ from aiohttp import web
 from aiohttp.test_utils import TestServer
 
 from dev_helper_bot.llm import AssistantTurn, LLMUnavailable, Message, ResponseFormat
+from dev_helper_bot.llm import openai_compat
 from dev_helper_bot.llm.openai_compat import (
     DEFAULT_TIMEOUT_SECONDS,
     OpenAICompatibleClient,
@@ -35,6 +36,9 @@ class FakeLLMServer:
 
     Поля status/payload/delay меняются из теста между запросами;
     все входящие запросы (заголовки + JSON) записываются в requests.
+
+    fail_times — сколько первых запросов уронить способом failure_mode:
+    "disconnect" (обрыв соединения без ответа) или "http" (status).
     """
 
     def __init__(self) -> None:
@@ -50,6 +54,9 @@ class FakeLLMServer:
         }
         self.delay = 0.0
         self.reject_response_format = False
+        self.fail_times = 0
+        self.failure_mode = "disconnect"
+        self.fail_status = 500
 
     async def handle(self, request: web.Request) -> web.Response:
         self.requests.append(
@@ -57,6 +64,15 @@ class FakeLLMServer:
         )
         if self.delay > 0:
             await asyncio.sleep(self.delay)
+        if self.fail_times > 0:
+            self.fail_times -= 1
+            if self.failure_mode == "disconnect":
+                # Обрыв соединения до/вместо ответа — клиент увидит
+                # сетевую ошибку (ServerDisconnectedError), не HTTP-статус.
+                if request.transport is not None:
+                    request.transport.abort()
+                return web.Response()
+            return web.Response(status=self.fail_status, text="server error")
         if self.status >= 400:
             return web.Response(status=self.status, text="server error")
         if self.reject_response_format and "response_format" in self.requests[-1]["json"]:
@@ -194,6 +210,58 @@ async def test_complete_with_non_integer_usage_fields_keeps_null(fake_llm_server
     assert turn["usage"]["output_tokens"] is None
 
 
+def _payload_with_usage(usage: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "choices": [
+            {"message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}
+        ],
+        "usage": usage,
+    }
+
+
+async def test_usage_cost_number_carries_billed_cost(fake_llm_server):
+    """Сценарий «Поставщик вернул стоимость»: число → billed_cost."""
+    usage = usage_payload(prompt=1000, completion=40) | {"cost": 1.2345}
+    fake_llm_server.payload = _payload_with_usage(usage)
+    client = make_client(fake_llm_server.base_url)
+
+    turn = await client.complete(MESSAGES)
+
+    assert turn["usage"]["billed_cost"] == pytest.approx(1.2345)
+    assert turn["usage"]["raw"]["cost"] == 1.2345  # raw хранит исходный объект
+
+
+async def test_usage_cost_zero_is_honest_zero_not_absence(fake_llm_server):
+    usage = usage_payload(prompt=10, completion=5) | {"cost": 0}
+    fake_llm_server.payload = _payload_with_usage(usage)
+    client = make_client(fake_llm_server.base_url)
+
+    turn = await client.complete(MESSAGES)
+
+    assert turn["usage"]["billed_cost"] == 0.0
+
+
+async def test_usage_without_cost_keeps_billed_cost_absent(fake_llm_server):
+    """LM Studio поле стоимости не отдаёт — billed_cost нет (absence ≠ 0)."""
+    usage = usage_payload(prompt=10, completion=5)
+    fake_llm_server.payload = _payload_with_usage(usage)
+    client = make_client(fake_llm_server.base_url)
+
+    turn = await client.complete(MESSAGES)
+
+    assert "billed_cost" not in turn["usage"]
+
+
+async def test_usage_non_numeric_cost_is_null(fake_llm_server):
+    usage = usage_payload(prompt=10, completion=5) | {"cost": "дёшево"}
+    fake_llm_server.payload = _payload_with_usage(usage)
+    client = make_client(fake_llm_server.base_url)
+
+    turn = await client.complete(MESSAGES)
+
+    assert turn["usage"]["billed_cost"] is None
+
+
 async def test_api_key_adds_bearer_header(fake_llm_server):
     client = make_client(fake_llm_server.base_url, api_key="secret-key")
 
@@ -212,12 +280,14 @@ async def test_no_api_key_means_no_authorization_header(fake_llm_server):
     assert "Authorization" not in headers
 
 
-async def test_http_error_raises_llm_unavailable(fake_llm_server):
-    fake_llm_server.status = 500
+async def test_http_401_error_raises_llm_unavailable_without_retry(fake_llm_server):
+    fake_llm_server.status = 401
     client = make_client(fake_llm_server.base_url)
 
-    with pytest.raises(LLMUnavailable, match="HTTP 500"):
+    with pytest.raises(LLMUnavailable, match="HTTP 401"):
         await client.complete(MESSAGES)
+
+    assert len(fake_llm_server.requests) == 1
 
 
 async def test_malformed_response_raises_llm_unavailable(fake_llm_server):
@@ -228,12 +298,16 @@ async def test_malformed_response_raises_llm_unavailable(fake_llm_server):
         await client.complete(MESSAGES)
 
 
-async def test_timeout_raises_llm_unavailable(fake_llm_server):
+async def test_timeout_raises_llm_unavailable(fake_llm_server, monkeypatch):
+    """Таймаут — временный сбой: ретраится, исчерпание — исключение."""
+    monkeypatch.setattr(openai_compat, "RETRY_DELAYS_SECONDS", (0.0, 0.0))
     fake_llm_server.delay = 0.5
     client = make_client(fake_llm_server.base_url, timeout=0.2)
 
     with pytest.raises(LLMUnavailable, match="timed out after 0.2"):
         await client.complete(MESSAGES)
+
+    assert len(fake_llm_server.requests) == 3
 
 
 def test_default_timeout_is_120_seconds():
@@ -374,3 +448,98 @@ async def test_http_400_without_response_format_raises(fake_llm_server):
         await client.complete(MESSAGES)
 
     assert len(fake_llm_server.requests) == 1
+
+
+# --- Ретраи временных сбоев (design D2, задачи 1.2/1.3) ---
+
+PINNED_MODEL = "openai/gpt-5.6-luna@provider=openai/flex&allow_fallbacks=false"
+
+
+@pytest.fixture
+def fast_retries(monkeypatch):
+    """Паузы повторов → 0: тестируем политику, не ожидание."""
+    monkeypatch.setattr(openai_compat, "RETRY_DELAYS_SECONDS", (0.0, 0.0))
+
+
+async def test_broken_response_then_success_retries_and_returns_turn(
+    fake_llm_server, fast_retries
+):
+    """Сценарий «Обрыв ответа и успешный повтор»: вызывающий код получает
+    штатный ход, исключения нет."""
+    fake_llm_server.fail_times = 1
+    fake_llm_server.failure_mode = "disconnect"
+    client = make_client(fake_llm_server.base_url)
+
+    turn = await client.complete(MESSAGES)
+
+    assert turn["content"] == "тест-ответ"
+    assert len(fake_llm_server.requests) == 2  # обрыв + успешный повтор
+
+
+async def test_connection_errors_exhaust_attempts_raises_llm_unavailable(
+    fake_llm_server, fast_retries
+):
+    """Сценарий «Исчерпание повторов»: 3 попытки, затем исключение."""
+    fake_llm_server.fail_times = 10  # всегда обрывать
+    fake_llm_server.failure_mode = "disconnect"
+    client = make_client(fake_llm_server.base_url)
+
+    with pytest.raises(LLMUnavailable, match="after 3 attempts"):
+        await client.complete(MESSAGES)
+
+    assert len(fake_llm_server.requests) == 3
+
+
+async def test_http_500_exhausts_attempts_with_retries(
+    fake_llm_server, fast_retries
+):
+    fake_llm_server.fail_times = 10
+    fake_llm_server.failure_mode = "http"
+    fake_llm_server.fail_status = 500
+    client = make_client(fake_llm_server.base_url)
+
+    with pytest.raises(LLMUnavailable, match="HTTP 500"):
+        await client.complete(MESSAGES)
+
+    assert len(fake_llm_server.requests) == 3
+
+
+async def test_http_404_retried_then_raises_on_exhaustion(
+    fake_llm_server, fast_retries
+):
+    """404 при жёстком пине — «endpoint временно недоступен»: ретраится."""
+    fake_llm_server.fail_times = 10
+    fake_llm_server.failure_mode = "http"
+    fake_llm_server.fail_status = 404
+    client = make_client(fake_llm_server.base_url)
+
+    with pytest.raises(LLMUnavailable, match="HTTP 404"):
+        await client.complete(MESSAGES)
+
+    assert len(fake_llm_server.requests) == 3
+
+
+async def test_http_404_then_success_uses_retry(fake_llm_server, fast_retries):
+    fake_llm_server.fail_times = 1
+    fake_llm_server.failure_mode = "http"
+    fake_llm_server.fail_status = 404
+    client = make_client(fake_llm_server.base_url)
+
+    turn = await client.complete(MESSAGES)
+
+    assert turn["content"] == "тест-ответ"
+    assert len(fake_llm_server.requests) == 2
+
+
+async def test_pinned_model_string_passes_through_as_is(fake_llm_server):
+    """Сценарий «Пин endpoint'а передаётся насквозь»: `@...` — часть имени
+    модели, уходит в payload без вырезания и нормализации."""
+    client = OpenAICompatibleClient(
+        base_url=fake_llm_server.base_url, model=PINNED_MODEL
+    )
+
+    turn = await client.complete(MESSAGES)
+
+    assert turn["content"] == "тест-ответ"
+    assert len(fake_llm_server.requests) == 1
+    assert fake_llm_server.requests[0]["json"]["model"] == PINNED_MODEL

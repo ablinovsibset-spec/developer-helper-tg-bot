@@ -62,7 +62,8 @@ CREATE TABLE IF NOT EXISTS runs (
     output_tokens INTEGER,
     cached_tokens INTEGER,
     reasoning_tokens INTEGER,
-    estimated_cost REAL
+    estimated_cost REAL,
+    billed_cost REAL
 );
 CREATE TABLE IF NOT EXISTS llm_calls (
     id INTEGER PRIMARY KEY,
@@ -80,6 +81,7 @@ CREATE TABLE IF NOT EXISTS llm_calls (
     prompt_chars INTEGER NOT NULL,
     prompt_roles TEXT,
     estimated_cost REAL,
+    billed_cost REAL,
     usage_raw TEXT
 );
 CREATE TABLE IF NOT EXISTS tool_calls (
@@ -170,6 +172,7 @@ class LLMCallRecord:
     prompt_chars: int
     prompt_roles: str | None
     estimated_cost: float | None
+    billed_cost: float | None
     usage_raw: str | None
 
 
@@ -224,6 +227,16 @@ class TelemetryStore:
             await self._conn.execute(
                 "ALTER TABLE llm_calls ADD COLUMN prompt_roles TEXT"
             )
+        if "billed_cost" not in columns:
+            await self._conn.execute(
+                "ALTER TABLE llm_calls ADD COLUMN billed_cost REAL"
+            )
+        cursor = await self._conn.execute("PRAGMA table_info(runs)")
+        run_columns = {row[1] for row in await cursor.fetchall()}
+        if "billed_cost" not in run_columns:
+            await self._conn.execute(
+                "ALTER TABLE runs ADD COLUMN billed_cost REAL"
+            )
 
     async def close(self) -> None:
         db, self._db = self._db, None
@@ -263,7 +276,8 @@ class TelemetryStore:
             "INSERT INTO llm_calls (run_id, created_at, turn_number, model, "
             "latency_ms, ok, input_tokens, output_tokens, cached_tokens, "
             "reasoning_tokens, messages_count, prompt_chars, prompt_roles, "
-            "estimated_cost, usage_raw) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "estimated_cost, billed_cost, usage_raw) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 record.run_id,
                 record.created_at,
@@ -279,6 +293,7 @@ class TelemetryStore:
                 record.prompt_chars,
                 record.prompt_roles,
                 record.estimated_cost,
+                record.billed_cost,
                 record.usage_raw,
             ),
         )
@@ -315,11 +330,14 @@ class TelemetryStore:
             "reasoning_tokens = "
             "  (SELECT SUM(reasoning_tokens) FROM llm_calls WHERE run_id = ?), "
             "estimated_cost = "
-            "  (SELECT SUM(estimated_cost) FROM llm_calls WHERE run_id = ?) "
+            "  (SELECT SUM(estimated_cost) FROM llm_calls WHERE run_id = ?), "
+            "billed_cost = "
+            "  (SELECT SUM(billed_cost) FROM llm_calls WHERE run_id = ?) "
             "WHERE id = ?",
             (
                 _utcnow_iso(),
                 status,
+                run_id,
                 run_id,
                 run_id,
                 run_id,
@@ -404,6 +422,13 @@ class RunRecorder:
                         usage, self._price_input_per_m, self._price_output_per_m
                     )
                     if ok
+                    else None
+                ),
+                # Ошибочный вызов не оплачивается: стоимость не фиксируется
+                # (спека agent-observability, «Стоимость ошибочного вызова»)
+                billed_cost=(
+                    usage.get("billed_cost")
+                    if ok and usage is not None
                     else None
                 ),
                 usage_raw=(

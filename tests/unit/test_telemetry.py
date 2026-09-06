@@ -52,14 +52,20 @@ def make_usage(
     output_tokens: int | None = 40,
     cached_tokens: int | None = None,
     reasoning_tokens: int | None = None,
+    billed_cost: float | None = None,
+    include_billed: bool = False,
 ) -> dict:
-    return {
+    usage = {
         "input_tokens": input_tokens,
         "output_tokens": output_tokens,
         "cached_tokens": cached_tokens,
         "reasoning_tokens": reasoning_tokens,
         "raw": {"prompt_tokens": input_tokens, "completion_tokens": output_tokens},
     }
+    if include_billed:
+        usage["billed_cost"] = billed_cost
+        usage["raw"]["cost"] = billed_cost
+    return usage
 
 
 # --- Хранилище: схема и вставки (task 2.3) ---
@@ -600,3 +606,149 @@ def test_count_prompt_roles_rules():
         "assistant": 0,
         "tool": 0,
     }
+
+
+# --- Фактическая стоимость поставщика (pin-routerai-flex, задачи 2.1–2.4) ---
+
+
+async def test_billed_cost_number_absence_zero(store):
+    """Число → значение; отсутствие поля → null; честный ноль → 0.0."""
+    recorder = RunRecorder(store, CHAT_ID)
+    await recorder.start()
+
+    await recorder.record_llm_call(
+        turn_number=1, model="m", latency_ms=1.0, ok=True,
+        usage=make_usage(include_billed=True, billed_cost=1.25),
+        messages_count=1, prompt_chars=1,
+    )
+    await recorder.record_llm_call(
+        turn_number=2, model="m", latency_ms=1.0, ok=True,
+        usage=make_usage(),  # поставщик стоимость не отдал (LM Studio)
+        messages_count=1, prompt_chars=1,
+    )
+    await recorder.record_llm_call(
+        turn_number=3, model="m", latency_ms=1.0, ok=True,
+        usage=make_usage(include_billed=True, billed_cost=0.0),
+        messages_count=1, prompt_chars=1,
+    )
+
+    rows = fetch_all(
+        store.path, "SELECT turn_number, billed_cost FROM llm_calls ORDER BY id"
+    )
+    assert rows == [(1, 1.25), (2, None), (3, 0.0)]
+
+
+async def test_finish_run_aggregates_billed_cost_sum(store):
+    recorder = RunRecorder(store, CHAT_ID, label="flex")
+    await recorder.start()
+
+    await recorder.record_llm_call(
+        turn_number=1, model="m", latency_ms=1.0, ok=True,
+        usage=make_usage(include_billed=True, billed_cost=1.25),
+        messages_count=1, prompt_chars=1,
+    )
+    await recorder.record_llm_call(
+        turn_number=2, model="m", latency_ms=1.0, ok=True,
+        usage=make_usage(include_billed=True, billed_cost=0.75),
+        messages_count=1, prompt_chars=1,
+    )
+    await recorder.finish(RUN_STATUS_SUCCESS)
+
+    ((billed,),) = fetch_all(store.path, "SELECT billed_cost FROM runs")
+    assert billed == pytest.approx(2.0)
+
+
+async def test_finish_run_without_billed_costs_stays_null(store):
+    """SUM по всем-null — null (absence ≠ 0), а не ноль."""
+    recorder = RunRecorder(store, CHAT_ID)
+    await recorder.start()
+    await recorder.record_llm_call(
+        turn_number=1, model="m", latency_ms=1.0, ok=True,
+        usage=make_usage(), messages_count=1, prompt_chars=1,
+    )
+    await recorder.finish(RUN_STATUS_SUCCESS)
+
+    ((billed,),) = fetch_all(store.path, "SELECT billed_cost FROM runs")
+    assert billed is None
+
+
+async def test_failed_call_records_no_billed_cost(store):
+    """Сценарий «Стоимость ошибочного вызова»: неуспешная попытка — без
+    стоимости, даже если usage формально её несёт."""
+    recorder = RunRecorder(store, CHAT_ID)
+    await recorder.start()
+
+    await recorder.record_llm_call(
+        turn_number=1, model="m", latency_ms=1.0, ok=False, usage=None,
+        messages_count=1, prompt_chars=1,
+    )
+    await recorder.record_llm_call(
+        turn_number=2, model="m", latency_ms=1.0, ok=False,
+        usage=make_usage(include_billed=True, billed_cost=9.0),
+        messages_count=1, prompt_chars=1,
+    )
+
+    rows = fetch_all(store.path, "SELECT ok, billed_cost FROM llm_calls")
+    assert rows == [(0, None), (0, None)]
+
+
+async def test_observing_client_carries_billed_cost_from_usage(store):
+    """Usage из хода с billed_cost доезжает до записи телеметрии."""
+    llm = FakeLLM(
+        turns=[
+            assistant_turn(
+                "ok",
+                usage=make_usage(include_billed=True, billed_cost=0.42),
+            )
+        ]
+    )
+    recorder = RunRecorder(store, CHAT_ID)
+    await recorder.start()
+    client = _observing(llm, recorder)
+
+    await client.complete([{"role": "user", "content": "привет"}])
+
+    ((billed,),) = fetch_all(store.path, "SELECT billed_cost FROM llm_calls")
+    assert billed == pytest.approx(0.42)
+
+
+async def test_migration_adds_billed_cost_columns_and_keeps_old_records(tmp_path):
+    db_path = tmp_path / "obs.db"
+    _make_legacy_db(db_path)
+    with sqlite3.connect(db_path) as conn:
+        llm_columns = {row[1] for row in conn.execute("PRAGMA table_info(llm_calls)")}
+        run_columns = {row[1] for row in conn.execute("PRAGMA table_info(runs)")}
+    assert "billed_cost" not in llm_columns
+    assert "billed_cost" not in run_columns
+
+    store = TelemetryStore(db_path)
+    await store.open()
+    try:
+        with sqlite3.connect(db_path) as conn:
+            llm_columns = {
+                row[1] for row in conn.execute("PRAGMA table_info(llm_calls)")
+            }
+            run_columns = {row[1] for row in conn.execute("PRAGMA table_info(runs)")}
+        assert "billed_cost" in llm_columns
+        assert "billed_cost" in run_columns
+    finally:
+        await store.close()
+
+    # Старая запись не тронута: billed_cost null (absence ≠ 0)
+    ((billed,),) = fetch_all(db_path, "SELECT billed_cost FROM llm_calls")
+    assert billed is None
+
+    # Повторное открытие — идемпотентно (без ошибки duplicate column)
+    store = TelemetryStore(db_path)
+    await store.open()
+    await store.close()
+    assert "billed_cost" in _llm_calls_columns(db_path)
+
+
+async def test_fresh_db_created_with_billed_cost_column(tmp_path):
+    db_path = tmp_path / "obs.db"
+    store = TelemetryStore(db_path)
+    await store.open()
+    await store.close()
+
+    assert "billed_cost" in _llm_calls_columns(db_path)

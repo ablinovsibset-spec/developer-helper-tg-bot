@@ -9,7 +9,10 @@ optimize-token-usage D5).
   Q2  Самый дорогой ход     — распределение input_tokens по turn_number
   Q3  Рост типов контекста  — доли типов по разбивке prompt_roles
   Q4  Повторные токены      — ре-отправки внутри прогона + межпрогонный слой
-  Q5  Стоимость             — сырая и эффективная (кэш-скидка cached_tokens)
+  Q5  Стоимость             — фактический биллинг поставщика (usage.cost,
+                              ₽ как есть) основной строкой при наличии;
+                              оценки по прайсу — сырая и эффективная
+                              (кэш-скидка cached_tokens) с пометкой «оценка»
 
 Как obs-dashboard.py: самодостаточный stdlib-скрипт (sqlite3), читает БД
 без запуска бота. У dashborada другая роль (агрегаты и timeline) — аудит
@@ -103,12 +106,13 @@ def load_llm_calls(conn: sqlite3.Connection, run_ids: list[int]) -> list[dict]:
     placeholders = ",".join("?" * len(run_ids))
     sql = (
         f"SELECT run_id, turn_number, input_tokens, output_tokens, "
-        f"cached_tokens, prompt_roles "
+        f"cached_tokens, prompt_roles, billed_cost "
         f"FROM llm_calls WHERE run_id IN ({placeholders}) "
         f"ORDER BY run_id, turn_number, id"
     )
     calls = []
-    for run_id, turn, input_tokens, output_tokens, cached_tokens, prompt_roles in conn.execute(sql, run_ids):
+    for (run_id, turn, input_tokens, output_tokens, cached_tokens,
+         prompt_roles, billed_cost) in conn.execute(sql, run_ids):
         roles = None
         if prompt_roles is not None:
             try:
@@ -119,7 +123,8 @@ def load_llm_calls(conn: sqlite3.Connection, run_ids: list[int]) -> list[dict]:
                       "input_tokens": input_tokens,
                       "output_tokens": output_tokens,
                       "cached_tokens": cached_tokens,
-                      "roles": roles})
+                      "roles": roles,
+                      "billed_cost": billed_cost})
     return calls
 
 
@@ -377,7 +382,8 @@ def render_q4(calls: list[dict]) -> str:
     return "\n".join(lines)
 
 
-# --- Q5: стоимость с кэш-скидкой (design D5, спека token-audit) ---
+# --- Q5: стоимость: фактический биллинг + оценки с кэш-скидкой (design D4
+# pin-routerai-flex, спека token-audit) ---
 
 
 def render_q5(
@@ -386,14 +392,27 @@ def render_q5(
     price_output_per_m: float,
     cached_price_multiplier: float,
 ) -> str:
-    """Сырая стоимость (все входные по входному прайсу) рядом с эффективной
-    (cached_tokens по отдельному прайсу). Без кэш-данных эффективная равна
-    сырой с явной пометкой, а не маскировкой."""
-    lines = ["Q5. Стоимость: сырая и эффективная (кэш-скидка)", "─" * 60]
+    """Стоимость в два слоя. Основной — фактический биллинг поставщика
+    (сумма billed_cost, ₽ как есть), когда поставщик его отдаёт.
+    Справочный — оценки по прайсу (сырая и эффективная с кэш-скидкой)
+    с явной пометкой «оценка». Без фактических стоимостей основной
+    строкой становится сырая оценка (прежнее поведение)."""
+    lines = ["Q5. Стоимость: фактическая и оценки по прайсу", "─" * 60]
     with_input = [c for c in calls if c["input_tokens"] is not None]
-    if not with_input:
+    billed_values = [c["billed_cost"] for c in calls if c["billed_cost"] is not None]
+    if not with_input and not billed_values:
         lines.append("Нет LLM-вызовов с входными токенами под фильтрами — "
                      "данных нет.")
+        return "\n".join(lines)
+
+    if billed_values:
+        total_billed = sum(billed_values)
+        lines.append(
+            f"Фактический биллинг поставщика: {total_billed:.4f} ₽  "
+            f"(сумма usage.cost по {len(billed_values)} вызовам; единицы "
+            f"поставщика, без конверсии)"
+        )
+    if not with_input:
         return "\n".join(lines)
 
     total_input = sum(c["input_tokens"] or 0 for c in calls)
@@ -411,26 +430,33 @@ def render_q5(
         + total_output * price_output_per_m
     ) / 1_000_000
 
+    # При наличии фактического биллинга оценки уходят в справочный слой
+    # с явной пометкой «оценка»; иначе сырая оценка — основная строка.
+    raw_label = "Сырая оценка:" if billed_values else "Сырая стоимость:"
+    effective_label = (
+        "Эффективная оценка:" if billed_values else "Эффективная стоимость:"
+    )
     lines.append(
-        f"Сырая стоимость:       ${raw_cost:.6f}  "
-        f"(входные ${price_input_per_m:g}/1M, выходные ${price_output_per_m:g}/1M, "
+        f"{raw_label:<20} ${raw_cost:.6f}  "
+        f"(оценка: входные ${price_input_per_m:g}/1M, "
+        f"выходные ${price_output_per_m:g}/1M, "
         f"все входные по полной цене)"
     )
     if has_cache_data:
         share = total_cached / total_input * 100 if total_input else 0.0
         lines.append(
-            f"Эффективная стоимость: ${effective_cost:.6f}  "
-            f"(кэшировано {share:.1f}% входных по ${cached_price:g}/1M = "
-            f"{cached_price_multiplier:g}× входного)"
+            f"{effective_label:<20} ${effective_cost:.6f}  "
+            f"(оценка: кэшировано {share:.1f}% входных по "
+            f"${cached_price:g}/1M = {cached_price_multiplier:g}× входного)"
         )
         lines.append(f"Экономия кэша:         ${raw_cost - effective_cost:.6f}")
     else:
         lines.append(
-            f"Эффективная стоимость: ${effective_cost:.6f}  — данных о кэше "
+            f"{effective_label:<20} ${effective_cost:.6f}  — данных о кэше "
             f"нет (cached_tokens не отдаётся поставщиком), равна сырой"
         )
     lines.append("Цель −30% считается по сырым входным токенам (Q4); "
-                 "кэш-скидка — справочно.")
+                 "кэш-скидка и фактический биллинг — справочно.")
     return "\n".join(lines)
 
 
