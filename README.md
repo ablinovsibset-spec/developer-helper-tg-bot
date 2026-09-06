@@ -58,7 +58,33 @@ scripts/sbx-setup.sh
 scripts/sbx-start.sh
 ```
 
-Скрипт поднимает остановленный сандбокс (если нужно), останавливает предыдущий процесс бота (если был), запускает бот в фоне с `LLM_BASE_URL=http://host.docker.internal:1234/v1`, открывает keepalive-сессию и показывает хвост лога. Токен Telegram бот читает из workspace-`.env`.
+Скрипт поднимает остановленный сандбокс (если нужно), останавливает предыдущий процесс бота (если был), запускает бот в фоне с `LLM_BASE_URL=http://host.docker.internal:1234/v1`, открывает keepalive-сессию и показывает хвост лога. Токен Telegram, `LLM_MODEL` и `LLM_API_KEY` бот читает из workspace-`.env`.
+
+**Override `LLM_BASE_URL` при запуске в сандбоксе.** Скрипт всегда передаёт `LLM_BASE_URL` в процесс бота явным `-e`, и это значение побеждает `localhost` из `.env` (dotenv не перезаписывает уже заданное окружение). Модель и ключ меняйте в `.env`; адрес endpoint'а — переменной при вызове скрипта.
+
+Локальный LM Studio (порт по умолчанию 1234):
+
+```bash
+scripts/sbx-start.sh
+```
+
+Другой порт на хосте (например Ollama):
+
+```bash
+LLM_PORT=11434 scripts/sbx-start.sh
+```
+
+Облачный OpenAI-совместимый endpoint (модель и ключ — в `.env`):
+
+```bash
+# в .env:
+#   LLM_MODEL=openai/gpt-5.6-luna
+#   LLM_API_KEY=sk-...
+
+LLM_BASE_URL=https://routerai.ru/api/v1 scripts/sbx-start.sh
+```
+
+После правок `.env` или override'ов нужен повторный `scripts/sbx-start.sh` (рестарт процесса бота).
 
 **Keepalive-сессия**: демон Docker Sandboxes останавливает сандбокс через ~30с после отключения последней exec-сессии — фоновый процесс бота сессией не считается. Скрипт удерживает сандбокс фоновым клиентом (`sbx exec devbot sleep infinity`, pid пишется в `/tmp/dev-helper-bot-keepalive-devbot.pid`). Пока этот процесс жив на хосте — бот работает; после ребута хоста он умирает, и сандбокс гасится (ручная модель восстановления: перезапустить `scripts/sbx-start.sh`).
 
