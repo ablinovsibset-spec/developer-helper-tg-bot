@@ -78,6 +78,7 @@ CREATE TABLE IF NOT EXISTS llm_calls (
     reasoning_tokens INTEGER,
     messages_count INTEGER NOT NULL,
     prompt_chars INTEGER NOT NULL,
+    prompt_roles TEXT,
     estimated_cost REAL,
     usage_raw TEXT
 );
@@ -105,6 +106,26 @@ def _utcnow_iso() -> str:
 def estimate_tool_tokens(output_size: int) -> int:
     """Оценка числа токенов результата инструмента: chars/4 (design D6)."""
     return output_size // TOOL_OUTPUT_CHARS_PER_TOKEN
+
+
+PROMPT_ROLE_NAMES = ("system", "user", "assistant", "tool")
+"""Роли сообщений, по которым телеметрия хранит разбивку промпта (design D1)."""
+
+
+def count_prompt_roles(messages: list[Message]) -> dict[str, int]:
+    """Разбивка промпта в символах по ролям сообщений (design D1).
+
+    Та же конвенция содержания, что у prompt_chars (len(content or ""));
+    роли вне четырёх известных игнорируются. Все четыре ключа присутствуют
+    всегда — 0 значит «роли в промпте не было», null в БД значит «разбивка
+    не считалась» (запись до миграции).
+    """
+    roles = dict.fromkeys(PROMPT_ROLE_NAMES, 0)
+    for message in messages:
+        role = message.get("role")
+        if role in roles:
+            roles[role] += len(message.get("content") or "")
+    return roles
 
 
 def estimate_cost(
@@ -147,6 +168,7 @@ class LLMCallRecord:
     reasoning_tokens: int | None
     messages_count: int
     prompt_chars: int
+    prompt_roles: str | None
     estimated_cost: float | None
     usage_raw: str | None
 
@@ -189,7 +211,19 @@ class TelemetryStore:
         await self._db.execute("PRAGMA journal_mode=WAL")
         await self._db.execute("PRAGMA foreign_keys=ON")
         await self._db.executescript(_SCHEMA)
+        await self._migrate()
         await self._db.commit()
+
+    async def _migrate(self) -> None:
+        """Idempotent-миграция старой базы (design D2): колонки, появившиеся
+        после первого релиза схемы, добавляются `ALTER TABLE`, если их нет.
+        Старые записи остаются null — absence ≠ 0 (как и для usage)."""
+        cursor = await self._conn.execute("PRAGMA table_info(llm_calls)")
+        columns = {row[1] for row in await cursor.fetchall()}
+        if "prompt_roles" not in columns:
+            await self._conn.execute(
+                "ALTER TABLE llm_calls ADD COLUMN prompt_roles TEXT"
+            )
 
     async def close(self) -> None:
         db, self._db = self._db, None
@@ -228,8 +262,8 @@ class TelemetryStore:
         await self._execute(
             "INSERT INTO llm_calls (run_id, created_at, turn_number, model, "
             "latency_ms, ok, input_tokens, output_tokens, cached_tokens, "
-            "reasoning_tokens, messages_count, prompt_chars, estimated_cost, "
-            "usage_raw) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "reasoning_tokens, messages_count, prompt_chars, prompt_roles, "
+            "estimated_cost, usage_raw) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 record.run_id,
                 record.created_at,
@@ -243,6 +277,7 @@ class TelemetryStore:
                 record.reasoning_tokens,
                 record.messages_count,
                 record.prompt_chars,
+                record.prompt_roles,
                 record.estimated_cost,
                 record.usage_raw,
             ),
@@ -342,6 +377,7 @@ class RunRecorder:
         usage: Usage | None,
         messages_count: int,
         prompt_chars: int,
+        prompt_roles: dict[str, int] | None = None,
         created_at: str | None = None,
     ) -> None:
         await self._store.insert_llm_call(
@@ -358,6 +394,11 @@ class RunRecorder:
                 reasoning_tokens=usage["reasoning_tokens"] if usage else None,
                 messages_count=messages_count,
                 prompt_chars=prompt_chars,
+                prompt_roles=(
+                    json.dumps(prompt_roles, ensure_ascii=False, sort_keys=True)
+                    if prompt_roles is not None
+                    else None
+                ),
                 estimated_cost=(
                     estimate_cost(
                         usage, self._price_input_per_m, self._price_output_per_m
@@ -423,6 +464,7 @@ class ObservingClient:
     ):
         turn_number = self._recorder.next_turn_number()
         prompt_chars = sum(len(m.get("content") or "") for m in messages)
+        prompt_roles = count_prompt_roles(messages)
         started = time.perf_counter()
         created_at = _utcnow_iso()
         try:
@@ -437,6 +479,7 @@ class ObservingClient:
                 usage=None,
                 messages_count=len(messages),
                 prompt_chars=prompt_chars,
+                prompt_roles=prompt_roles,
                 created_at=created_at,
             )
             raise
@@ -449,6 +492,7 @@ class ObservingClient:
             usage=turn.get("usage"),
             messages_count=len(messages),
             prompt_chars=prompt_chars,
+            prompt_roles=prompt_roles,
             created_at=created_at,
         )
         return turn

@@ -12,6 +12,7 @@ from dev_helper_bot.telemetry import (
     ObservingClient,
     RunRecorder,
     TelemetryStore,
+    count_prompt_roles,
     estimate_cost,
     estimate_tool_tokens,
 )
@@ -423,3 +424,179 @@ async def test_wrapper_passes_through_unexpected_exception(store):
 
     with pytest.raises(Boom):
         await client.complete([{"role": "user", "content": "x"}])
+
+
+# --- Разбивка промпта по ролям: схема и миграция (tasks 1.1–1.3) ---
+
+# Схема llm_calls до появления prompt_roles (первый релиз add-agent-observability)
+_LEGACY_LLM_CALLS_DDL = """
+CREATE TABLE llm_calls (
+    id INTEGER PRIMARY KEY,
+    run_id INTEGER NOT NULL REFERENCES runs(id),
+    created_at TEXT NOT NULL,
+    turn_number INTEGER NOT NULL,
+    model TEXT,
+    latency_ms REAL NOT NULL,
+    ok INTEGER NOT NULL,
+    input_tokens INTEGER,
+    output_tokens INTEGER,
+    cached_tokens INTEGER,
+    reasoning_tokens INTEGER,
+    messages_count INTEGER NOT NULL,
+    prompt_chars INTEGER NOT NULL,
+    estimated_cost REAL,
+    usage_raw TEXT
+);
+"""
+
+
+def _make_legacy_db(db_path) -> None:
+    """База «как до миграции»: старая схема + одна живая запись."""
+    with sqlite3.connect(db_path) as conn:
+        conn.executescript(
+            "CREATE TABLE runs ("
+            " id INTEGER PRIMARY KEY, chat_id INTEGER NOT NULL, label TEXT,"
+            " started_at TEXT NOT NULL, finished_at TEXT, status TEXT,"
+            " llm_calls INTEGER, tool_calls INTEGER, input_tokens INTEGER,"
+            " output_tokens INTEGER, cached_tokens INTEGER,"
+            " reasoning_tokens INTEGER, estimated_cost REAL);"
+            + _LEGACY_LLM_CALLS_DDL
+        )
+        conn.execute(
+            "INSERT INTO runs (id, chat_id, started_at, status) "
+            "VALUES (1, ?, '2026-09-01T00:00:00+00:00', 'success')",
+            (CHAT_ID,),
+        )
+        conn.execute(
+            "INSERT INTO llm_calls (run_id, created_at, turn_number, model,"
+            " latency_ms, ok, input_tokens, output_tokens, messages_count,"
+            " prompt_chars) VALUES (1, '2026-09-01T00:00:01+00:00', 1, 'm',"
+            " 10.0, 1, 100, 40, 2, 500)"
+        )
+
+
+def _llm_calls_columns(db_path) -> set[str]:
+    with sqlite3.connect(db_path) as conn:
+        return {row[1] for row in conn.execute("PRAGMA table_info(llm_calls)")}
+
+
+async def test_migration_adds_column_and_keeps_old_records(tmp_path):
+    db_path = tmp_path / "obs.db"
+    _make_legacy_db(db_path)
+    assert "prompt_roles" not in _llm_calls_columns(db_path)
+
+    store = TelemetryStore(db_path)
+    await store.open()
+    try:
+        assert "prompt_roles" in _llm_calls_columns(db_path)
+    finally:
+        await store.close()
+
+    # Старая запись не тронута: разбивка null (absence ≠ 0), остальное как было
+    row = fetch_all(
+        db_path,
+        "SELECT prompt_roles, input_tokens, output_tokens, prompt_chars, "
+        "turn_number FROM llm_calls",
+    )[0]
+    assert row == (None, 100, 40, 500, 1)
+
+    # Повторное открытие — идемпотентно (без ошибки duplicate column)
+    store = TelemetryStore(db_path)
+    await store.open()
+    await store.close()
+    assert "prompt_roles" in _llm_calls_columns(db_path)
+
+
+async def test_fresh_db_created_with_prompt_roles_column(tmp_path):
+    db_path = tmp_path / "obs.db"
+    store = TelemetryStore(db_path)
+    await store.open()
+    await store.close()
+
+    assert "prompt_roles" in _llm_calls_columns(db_path)
+
+
+async def test_observing_client_records_prompt_roles_breakdown(store):
+    recorder = RunRecorder(store, CHAT_ID)
+    await recorder.start()
+    client = _observing(FakeLLM(), recorder)
+
+    await client.complete(
+        [
+            {"role": "system", "content": "правила"},
+            {"role": "user", "content": "привет"},
+            {"role": "assistant", "content": None, "tool_calls": []},
+            {
+                "role": "tool",
+                "tool_call_id": "call_1",
+                "content": "exit_code: 0",
+            },
+        ]
+    )
+
+    import json as _json
+
+    raw = fetch_all(store.path, "SELECT prompt_roles FROM llm_calls")[0][0]
+    assert _json.loads(raw) == {
+        "system": len("правила"),
+        "user": len("привет"),
+        "assistant": 0,  # content=None считается нулём
+        "tool": len("exit_code: 0"),
+    }
+
+
+async def test_prompt_roles_null_when_not_passed(store):
+    """Запись без разбивки (прямая запись через recorder) — null, не нули."""
+    recorder = RunRecorder(store, CHAT_ID)
+    await recorder.start()
+
+    await recorder.record_llm_call(
+        turn_number=1,
+        model="m",
+        latency_ms=5.0,
+        ok=True,
+        usage=None,
+        messages_count=1,
+        prompt_chars=10,
+    )
+
+    raw = fetch_all(store.path, "SELECT prompt_roles FROM llm_calls")[0][0]
+    assert raw is None
+
+
+async def test_failed_call_also_carries_prompt_roles(store):
+    """Ошибочная попытка тоже видела промпт — разбивка фиксируется."""
+    llm = FakeLLM(error=LLMUnavailable("down"))
+    recorder = RunRecorder(store, CHAT_ID)
+    await recorder.start()
+    client = _observing(llm, recorder)
+
+    with pytest.raises(LLMUnavailable):
+        await client.complete([{"role": "system", "content": "s"},
+                               {"role": "user", "content": "u"}])
+
+    import json as _json
+
+    raw = fetch_all(store.path, "SELECT prompt_roles FROM llm_calls")[0][0]
+    assert _json.loads(raw)["system"] == 1
+    assert _json.loads(raw)["user"] == 1
+
+
+def test_count_prompt_roles_rules():
+    roles = count_prompt_roles(
+        [
+            {"role": "system", "content": "ab"},
+            {"role": "user", "content": "cde"},
+            {"role": "user", "content": None},
+            {"role": "tool", "content": "f"},
+            {"role": "unknown", "content": "ignored"},
+        ]
+    )
+    # Все четыре ключа всегда, неизвестные роли игнорируются
+    assert roles == {"system": 2, "user": 3, "assistant": 0, "tool": 1}
+    assert count_prompt_roles([]) == {
+        "system": 0,
+        "user": 0,
+        "assistant": 0,
+        "tool": 0,
+    }
