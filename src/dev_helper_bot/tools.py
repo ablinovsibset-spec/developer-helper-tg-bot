@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 import shlex
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any, Protocol
 
+from dev_helper_bot.skills import Skill
+
 EXEC_TOOL_NAME = "exec"
 READ_FILE_TOOL_NAME = "read_file"
+GET_SKILL_TOOL_NAME = "get_skill"
 SEARCH_TOOL_NAME = "search_history"
 LIST_TOOL_NAME = "list_sessions"
 EXEC_TIMEOUT_SECONDS = 30.0
@@ -117,6 +121,30 @@ LIST_TOOL_SPEC: dict[str, Any] = {
             "Параметров нет."
         ),
         "parameters": {"type": "object", "properties": {}},
+    },
+}
+
+GET_SKILL_TOOL_SPEC: dict[str, Any] = {
+    "type": "function",
+    "function": {
+        "name": GET_SKILL_TOOL_NAME,
+        "description": (
+            "Загрузить полное тело скилла по имени из каталога в системном "
+            "промпте. Вызывай, когда description скилла подходит к запросу; "
+            "следуй возвращённой инструкции. Не читает песочницу."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "name": {
+                    "type": "string",
+                    "description": (
+                        "Имя скилла из каталога (например morning, wttr-in-api)"
+                    ),
+                },
+            },
+            "required": ["name"],
+        },
     },
 }
 
@@ -243,6 +271,28 @@ def format_page(lines: list[str], first_number: int, has_more: bool) -> str:
         budget = READ_FILE_OUTPUT_LIMIT - len(hint) - 1
         body = [f"{first_number}: {lines[0]}"[:budget]]
     return "\n".join(body) + "\n" + hint
+
+
+def get_skill(skills: Mapping[str, Skill], name: str | None) -> str:
+    """Возвращает тело скилла из in-memory каталога (design D5/D6).
+
+    Неизвестное или пустое имя — текст ошибки для модели, без исключения.
+    Успешный ответ — только markdown-тело без frontmatter.
+    """
+    if name is None or not str(name).strip():
+        return (
+            'Ошибка аргументов: обязательный строковый параметр "name" '
+            "отсутствует или пуст."
+        )
+    key = str(name).strip()
+    skill = skills.get(key)
+    if skill is None:
+        known = ", ".join(sorted(skills)) or "(каталог пуст)"
+        return (
+            f"Ошибка: скилл {key!r} не найден среди загруженных. "
+            f"Доступны: {known}."
+        )
+    return skill.body
 
 
 async def read_file(

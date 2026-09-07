@@ -28,7 +28,7 @@ from dev_helper_bot.llm import LLMClient, LLMUnavailable, Message
 from dev_helper_bot.memory import ChatHistorySearcher, MemoryStore
 from dev_helper_bot.obs_web import build_app, start_app, stop_app
 from dev_helper_bot.sandbox import SandboxExecutor, prepare_sandbox_environment
-from dev_helper_bot.skills import build_request_messages, default_skills_dir, load_skills
+from dev_helper_bot.skills import Skill, build_request_messages, default_skills_dir, load_skills
 from dev_helper_bot.telemetry import (
     RUN_STATUS_LLM_ERROR,
     ObservingClient,
@@ -37,6 +37,7 @@ from dev_helper_bot.telemetry import (
 )
 from dev_helper_bot.tools import (
     EXEC_TOOL_SPEC,
+    GET_SKILL_TOOL_SPEC,
     LIST_TOOL_SPEC,
     READ_FILE_TOOL_SPEC,
     SEARCH_TOOL_SPEC,
@@ -50,6 +51,7 @@ NEW_CHAT_CONFIRMATION = "🆕 Контекст сброшен — начинае
 AGENT_TOOLS = [
     EXEC_TOOL_SPEC,
     READ_FILE_TOOL_SPEC,
+    GET_SKILL_TOOL_SPEC,
     SEARCH_TOOL_SPEC,
     LIST_TOOL_SPEC,
 ]
@@ -72,7 +74,7 @@ async def handle_text(
     bot: Bot,
     llm: LLMClient,
     memory: MemoryStore,
-    skills: dict[str, str],
+    skills: dict[str, Skill],
     executor: CommandExecutor,
     telemetry: TelemetryStore | None = None,
 ) -> None:
@@ -112,6 +114,7 @@ async def handle_text(
             tools=AGENT_TOOLS,
             executor=executor,
             history_search=ChatHistorySearcher(memory, chat_id),
+            skills=skills,
             recorder=recorder,
         )
     except LLMUnavailable as exc:
