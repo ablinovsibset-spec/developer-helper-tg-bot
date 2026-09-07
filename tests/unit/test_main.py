@@ -438,6 +438,22 @@ async def test_main_opens_and_closes_memory_store(fake_bot, monkeypatch, tmp_pat
     monkeypatch.setattr(main_module, "SandboxExecutor", lambda: executor)
     monkeypatch.setattr(main_module, "memory_db_path", lambda: str(tmp_path / "m.db"))
     monkeypatch.setattr(main_module, "obs_db_path", lambda: str(tmp_path / "obs.db"))
+    monkeypatch.setattr(main_module, "obs_web_port", lambda: 8765)
+    # Веб-дашборд — заглушки lifecycle, чтобы не открывать реальный порт в тестах
+    monkeypatch.setattr(main_module, "build_app", lambda store, **kw: ("web_app", store))
+    web_runner = object()
+
+    async def fake_start_app(app, *, host=None, port=None):
+        events.append("web_started")
+        assert app[0] == "web_app"
+        return web_runner
+
+    async def fake_stop_app(runner):
+        events.append("web_stopped")
+        assert runner is web_runner
+
+    monkeypatch.setattr(main_module, "start_app", fake_start_app)
+    monkeypatch.setattr(main_module, "stop_app", fake_stop_app)
     monkeypatch.setattr(main_module, "Bot", FakeMainBot)
     monkeypatch.setattr(
         main_module.Dispatcher, "start_polling", FakeDispatcher.start_polling
@@ -446,7 +462,11 @@ async def test_main_opens_and_closes_memory_store(fake_bot, monkeypatch, tmp_pat
     with pytest.raises(RuntimeError, match="polling stopped"):
         await main_module.main()
 
-    assert events == ["bot_created", "prepared", "polling", "session_closed"]
+    # Веб стартует до polling и останавливается в finally (design D1)
+    assert events == [
+        "bot_created", "prepared", "web_started", "polling",
+        "web_stopped", "session_closed",
+    ]
     assert executor.stop_calls == 1  # best-effort stop при завершении бота
     # Store закрыт: переоткрытие того же файла видит записанное
     reopened = MemoryStore(tmp_path / "m.db")
@@ -467,3 +487,50 @@ async def test_main_opens_and_closes_memory_store(fake_bot, monkeypatch, tmp_pat
             )
         }
     assert {"runs", "llm_calls", "tool_calls"} <= tables
+
+
+async def test_main_busy_web_port_stops_before_polling(fake_bot, monkeypatch, tmp_path):
+    """Сбой bind порта дашборда — fail-fast: polling не стартует, понятная причина
+    (design D2, task 3.2)."""
+    import dev_helper_bot.main as main_module
+
+    executor = FakeCommandExecutor()
+    polling_started = []
+
+    class FakeSession:
+        async def close(self) -> None: ...
+
+    class FakeMainBot:
+        def __init__(self, token: str, default=None) -> None:
+            self.session = FakeSession()
+
+    class FakeDispatcher(main_module.Dispatcher):
+        async def start_polling(self, bot) -> None:
+            polling_started.append(True)
+            raise AssertionError("polling must not start when web port is busy")
+
+    async def fake_prepare() -> None: ...
+
+    async def fake_start_app(app, *, host=None, port=None):
+        raise OSError("address already in use")
+
+    monkeypatch.setattr(main_module, "load_dotenv", lambda: None)
+    monkeypatch.setattr(main_module, "telegram_token", lambda: "test-token")
+    monkeypatch.setattr(main_module, "make_llm", lambda: fake_bot)
+    monkeypatch.setattr(main_module, "prepare_sandbox_environment", fake_prepare)
+    monkeypatch.setattr(main_module, "SandboxExecutor", lambda: executor)
+    monkeypatch.setattr(main_module, "memory_db_path", lambda: str(tmp_path / "m.db"))
+    monkeypatch.setattr(main_module, "obs_db_path", lambda: str(tmp_path / "obs.db"))
+    monkeypatch.setattr(main_module, "obs_web_port", lambda: 8765)
+    monkeypatch.setattr(main_module, "build_app", lambda store, **kw: "web_app")
+    monkeypatch.setattr(main_module, "start_app", fake_start_app)
+    monkeypatch.setattr(main_module, "stop_app", lambda r: None)
+    monkeypatch.setattr(main_module, "Bot", FakeMainBot)
+    monkeypatch.setattr(
+        main_module.Dispatcher, "start_polling", FakeDispatcher.start_polling
+    )
+
+    with pytest.raises(OSError, match="address already in use"):
+        await main_module.main()
+
+    assert polling_started == []  # polling не стартовал

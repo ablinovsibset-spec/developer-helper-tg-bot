@@ -20,10 +20,13 @@ from dev_helper_bot.config import (
     obs_label,
     obs_price_input_per_m,
     obs_price_output_per_m,
+    obs_web_host,
+    obs_web_port,
     telegram_token,
 )
 from dev_helper_bot.llm import LLMClient, LLMUnavailable, Message
 from dev_helper_bot.memory import ChatHistorySearcher, MemoryStore
+from dev_helper_bot.obs_web import build_app, start_app, stop_app
 from dev_helper_bot.sandbox import SandboxExecutor, prepare_sandbox_environment
 from dev_helper_bot.skills import build_request_messages, default_skills_dir, load_skills
 from dev_helper_bot.telemetry import (
@@ -155,22 +158,37 @@ async def main() -> None:
     except Exception:
         log.warning("telemetry disabled: cannot open %s", obs_db_path(), exc_info=True)
         telemetry = None
-    dp = Dispatcher()
-    dp["llm"] = llm
-    dp["memory"] = memory
-    dp["telemetry"] = telemetry
-    dp["skills"] = load_skills(default_skills_dir())
-    dp["executor"] = executor
-    dp.message.register(handle_new, Command("new"))
-    dp.message.register(handle_text, F.text)
-
-    log.info("Bot started. Long-polling…")
+    # Веб-дашборд (change add-obs-web-dashboard, design D1/D2): in-process
+    # aiohttp на loopback. Сбой bind (занятый порт) — fail-fast: исключение
+    # до polling с понятной причиной. Сбой телеметрии — soft: веб жив и отдаёт
+    # заглушку «телеметрия недоступна». Цены для аудита — те же, что у recorder.
+    # Весь lifecycle (веб + polling + ресурсы) — в одном try/finally, чтобы
+    # при сбое bind порта закрыть memory/telemetry, а не оставить открытыми.
+    web_app = build_app(
+        telemetry,
+        price_input_per_m=obs_price_input_per_m(),
+        price_output_per_m=obs_price_output_per_m(),
+    )
+    web_runner = None
     try:
+        web_runner = await start_app(web_app, host=obs_web_host(), port=obs_web_port())
+        dp = Dispatcher()
+        dp["llm"] = llm
+        dp["memory"] = memory
+        dp["telemetry"] = telemetry
+        dp["skills"] = load_skills(default_skills_dir())
+        dp["executor"] = executor
+        dp.message.register(handle_new, Command("new"))
+        dp.message.register(handle_text, F.text)
+
+        log.info("Bot started. Long-polling…")
         await dp.start_polling(bot)
     finally:
         # Контейнер-жильца убираем best-effort: ошибки удаления не должны
         # прерывать завершение (спека docker-sandbox). Оставшийся после
         # аварийного завершения контейнер подберёт sweep при следующем старте.
+        if web_runner is not None:
+            await stop_app(web_runner)
         await executor.stop()
         await memory.close()
         if telemetry is not None:

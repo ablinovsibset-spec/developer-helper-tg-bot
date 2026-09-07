@@ -84,3 +84,26 @@ def obs_label() -> str | None:
     Задаётся на запуск процесса: все прогоны этого процесса несут метку,
     dashboard фильтрует по ней (--label)."""
     return os.getenv("OBS_LABEL") or None
+
+
+DEFAULT_OBS_WEB_PORT = 8765
+"""Дефолтный порт веб-дашборда (design D6); bind всегда 127.0.0.1 на хосте."""
+
+DEFAULT_OBS_WEB_HOST = "127.0.0.1"
+"""Дефолтный host бинда дашборда — loopback хоста (design D6: без LAN).
+В сандбоксе sbx переопределяется на 0.0.0.0: проброс sbx ports входит в VM
+через её сетевой интерфейс, а не loopback, так что bind на 127.0.0.1 внутри VM
+недостижим для форварда. 0.0.0.0 внутри VM безопасен — sbx ports публикует
+только на loopback хоста, с LAN дашборд недоступен."""
+
+
+def obs_web_port() -> int:
+    """Порт дашборда; переопределяется OBS_WEB_PORT (design D6)."""
+    return int(os.getenv("OBS_WEB_PORT", DEFAULT_OBS_WEB_PORT))
+
+
+def obs_web_host() -> str:
+    """Host бинда дашборда; переопределяется OBS_WEB_HOST (design D6).
+    Дефолт 127.0.0.1 (хост); в сандбоксе sbx — 0.0.0.0, иначе проброс портов
+    не достает до loopback VM."""
+    return os.getenv("OBS_WEB_HOST", DEFAULT_OBS_WEB_HOST)

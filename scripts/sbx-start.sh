@@ -22,6 +22,7 @@ set -euo pipefail
 
 SANDBOX_NAME="${SBX_NAME:-devbot}"
 LLM_PORT="${LLM_PORT:-1234}"
+OBS_WEB_PORT="${OBS_WEB_PORT:-8765}"
 WORKSPACE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 LLM_BASE_URL="${LLM_BASE_URL:-http://host.docker.internal:${LLM_PORT}/v1}"
 KEEPALIVE_PID_FILE="/tmp/dev-helper-bot-keepalive-${SANDBOX_NAME}.pid"
@@ -56,7 +57,10 @@ sbx exec "${SANDBOX_NAME}" bash -c "echo \"=== bot start \$(date '+%Y-%m-%d %H:%
 say "Запускаю бот в фоне с LLM_BASE_URL=${LLM_BASE_URL} (логи: /tmp/bot.log внутри VM)"
 # Отделяемся классически (setsid + перенаправление всех потоков внутри VM):
 # процесс переживает закрытие exec-сессии и хостового клиента.
-sbx exec -e "LLM_BASE_URL=${LLM_BASE_URL}" "${SANDBOX_NAME}" \
+# OBS_WEB_HOST=0.0.0.0: дашборд биндится на все интерфейсы VM, чтобы проброс
+# sbx ports (вход через сетевой интерфейс VM) доставал до него; на хост
+# публикуется только loopback (см. config.py / design D6).
+sbx exec -e "LLM_BASE_URL=${LLM_BASE_URL}" -e "OBS_WEB_HOST=0.0.0.0" "${SANDBOX_NAME}" \
     bash -c "cd '${WORKSPACE}' && setsid nohup \$HOME/.venv-devbot/bin/python -m dev_helper_bot.main >> /tmp/bot.log 2>&1 < /dev/null & echo 'бот запущен (pid '\$!')'"
 
 say "Открываю keepalive-сессию (удерживает сандбокс от автостопа)"
@@ -68,7 +72,15 @@ fi
 nohup sbx exec "${SANDBOX_NAME}" sleep infinity >/dev/null 2>&1 &
 echo $! > "${KEEPALIVE_PID_FILE}"
 
+# Публикуем порт веб-дашборда телеметрии на хост (change add-obs-web-dashboard):
+# дашборд биндится на 127.0.0.1:OBS_WEB_PORT *внутри* VM, а браузер на хосте
+# до loopback VM не достаёт. sbx ports пробрасывает VM:OBS_WEB_PORT на
+# 127.0.0.1:OBS_WEB_PORT хоста. Идемпотентно: повторный запуск не дублирует.
+say "Публикую порт дашборда ${OBS_WEB_PORT} (http://127.0.0.1:${OBS_WEB_PORT}/)"
+sbx ports "${SANDBOX_NAME}" --publish "${OBS_WEB_PORT}:${OBS_WEB_PORT}" >/dev/null 2>&1 || \
+    say "предупреждение: не удалось опубликовать порт ${OBS_WEB_PORT} (возможно, уже опубликован)"
+
 say "Жду 3с и показываю хвост лога"
 sleep 3
 sbx exec "${SANDBOX_NAME}" tail -n 50 /tmp/bot.log
-say "Готово. Пауза/остановка: scripts/sbx-stop.sh; keepalive pid: $(cat "${KEEPALIVE_PID_FILE}")"
+say "Готово. Дашборд: http://127.0.0.1:${OBS_WEB_PORT}/  Пауза/остановка: scripts/sbx-stop.sh; keepalive pid: $(cat "${KEEPALIVE_PID_FILE}")"
