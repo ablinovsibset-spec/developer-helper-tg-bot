@@ -18,8 +18,7 @@ from dev_helper_bot.main import (
     send_chunked,
 )
 from dev_helper_bot.memory import MemoryStore
-from dev_helper_bot.skills import MEMORY_ENV_LINE, SANDBOX_ENV_LINE
-
+from dev_helper_bot.skills import MEMORY_ENV_LINE, SANDBOX_ENV_LINE, SKILLS_CATALOG_INTRO, Skill
 from tests.conftest import (
     FakeCommandExecutor,
     FakeMessage,
@@ -30,15 +29,22 @@ from tests.conftest import (
 )
 
 CHAT_ID = 42
-SKILLS = {"wttr-in-api": "Правила wttr.in"}
-T1 = datetime(2026, 8, 28, 7, 45)
-T2 = datetime(2026, 8, 28, 7, 47)
+SKILLS = {
+    "wttr-in-api": Skill(
+        name="wttr-in-api",
+        description="Погода через wttr.in",
+        body="Правила wttr.in: curl -s format=3",
+    )
+}
 SYSTEM = (
     "Reasoning: medium"
     f"\n{SANDBOX_ENV_LINE}"
     f"\n{MEMORY_ENV_LINE}"
-    "\n\n## wttr-in-api\nПравила wttr.in"
+    f"\n\n{SKILLS_CATALOG_INTRO}"
+    "\n- wttr-in-api: Погода через wttr.in"
 )
+T1 = datetime(2026, 8, 28, 7, 45)
+T2 = datetime(2026, 8, 28, 7, 47)
 TIME_AT_T1 = "Текущие дата и время: 2026-08-28 07:45 (пятница)"
 TIME_AT_T2 = "Текущие дата и время: 2026-08-28 07:47 (пятница)"
 
@@ -105,6 +111,42 @@ async def test_handle_text_prompt_goes_to_llm_with_system_and_tools(
         user_at(TIME_AT_T1, "привет"),
     ]
     assert llm.tools_per_request == [AGENT_TOOLS]
+    assert any(
+        (t.get("function") or {}).get("name") == "get_skill" for t in AGENT_TOOLS
+    )
+
+
+async def test_handle_text_get_skill_body_reaches_llm(
+    fake_bot, store, monkeypatch
+):
+    """Цикл с get_skill: тело скилла без frontmatter попадает в следующий запрос."""
+    monkeypatch.setattr(main_module, "datetime", fake_datetime(T1))
+    llm = make_scripted_llm(
+        [
+            assistant_turn(
+                content=None,
+                tool_calls=[
+                    tool_call(
+                        name="get_skill",
+                        arguments='{"name": "wttr-in-api"}',
+                    )
+                ],
+                finish_reason="tool_calls",
+            ),
+            assistant_turn(content="погода готова"),
+        ]
+    )
+
+    await handle(FakeMessage("погода", chat_id=CHAT_ID), fake_bot, llm, store)
+
+    assert fake_bot.sent[-1]["text"] == "погода готова"
+    second = llm.requests[1]
+    assert [m["role"] for m in second] == ["system", "user", "assistant", "tool"]
+    tool_msg = second[3]
+    assert tool_msg["content"] == SKILLS["wttr-in-api"].body
+    assert "format=3" in tool_msg["content"]
+    assert SYSTEM == llm.requests[0][0]["content"]
+    assert "format=3" not in SYSTEM
 
 
 async def test_handle_text_llm_unavailable_sends_friendly_error(fake_bot, store):

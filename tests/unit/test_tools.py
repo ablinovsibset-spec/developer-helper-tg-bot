@@ -226,3 +226,51 @@ def test_exec_description_directs_files_to_read_file():
 
     assert "read_file" in description
     assert "cat" in description
+
+
+def test_get_skill_returns_body_without_frontmatter(tmp_path):
+    from dev_helper_bot.skills import load_skills
+    from dev_helper_bot.tools import get_skill
+    from tests.unit.test_skills import skill_md
+
+    skills_dir = tmp_path / "skills"
+    skills_dir.mkdir()
+    (skills_dir / "morning.md").write_text(
+        skill_md("morning", "Утро", "Тело утренней сводки\nбез frontmatter"),
+        encoding="utf-8",
+    )
+    skills = load_skills(skills_dir)
+
+    result = get_skill(skills, "morning")
+
+    assert result.startswith("Тело утренней сводки")
+    assert "name:" not in result
+    assert "---" not in result
+    assert result == skills["morning"].body
+
+
+def test_get_skill_unknown_name_returns_error_text(tmp_path):
+    from dev_helper_bot.skills import load_skills
+    from dev_helper_bot.tools import get_skill
+    from tests.unit.test_skills import skill_md
+
+    skills_dir = tmp_path / "skills"
+    skills_dir.mkdir()
+    (skills_dir / "morning.md").write_text(
+        skill_md("morning", "Утро", "тело"), encoding="utf-8"
+    )
+    skills = load_skills(skills_dir)
+
+    result = get_skill(skills, "nope")
+
+    assert result.startswith("Ошибка")
+    assert "nope" in result
+    assert "morning" in result
+
+
+def test_get_skill_empty_name_returns_validation_error():
+    from dev_helper_bot.tools import get_skill
+
+    assert "Ошибка" in get_skill({}, "")
+    assert "Ошибка" in get_skill({}, None)
+    assert "name" in get_skill({}, "")

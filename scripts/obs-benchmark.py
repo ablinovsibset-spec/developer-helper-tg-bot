@@ -67,7 +67,7 @@ from dev_helper_bot.sandbox import (  # noqa: E402
     SandboxExecutor,
     prepare_sandbox_environment,
 )
-from dev_helper_bot.skills import build_request_messages, default_skills_dir, load_skills  # noqa: E402
+from dev_helper_bot.skills import Skill, build_request_messages, default_skills_dir, load_skills  # noqa: E402
 from dev_helper_bot.telemetry import (  # noqa: E402
     RUN_STATUS_LABELS,
     RUN_STATUS_LLM_ERROR,
@@ -77,6 +77,7 @@ from dev_helper_bot.telemetry import (  # noqa: E402
 )
 from dev_helper_bot.tools import (  # noqa: E402
     EXEC_TOOL_SPEC,
+    GET_SKILL_TOOL_SPEC,
     LIST_TOOL_SPEC,
     READ_FILE_TOOL_SPEC,
     SEARCH_TOOL_SPEC,
@@ -95,6 +96,7 @@ FIXTURE_SANDBOX_PATH = "/work/sample_project"
 AGENT_TOOLS = [
     EXEC_TOOL_SPEC,
     READ_FILE_TOOL_SPEC,
+    GET_SKILL_TOOL_SPEC,
     SEARCH_TOOL_SPEC,
     LIST_TOOL_SPEC,
 ]
@@ -175,7 +177,7 @@ class Harness:
     memory: MemoryStore
     telemetry: TelemetryStore
     executor: SandboxExecutor
-    skills: dict[str, str] = field(default_factory=dict)
+    skills: dict[str, Skill] = field(default_factory=dict)
     label: str = BENCHMARK_LABEL
 
     async def process_message(self, chat_id: int, text: str) -> str:
@@ -206,6 +208,7 @@ class Harness:
                 tools=AGENT_TOOLS,
                 executor=self.executor,
                 history_search=ChatHistorySearcher(self.memory, chat_id),
+                skills=self.skills,
                 recorder=recorder,
             )
         except LLMUnavailable as exc:

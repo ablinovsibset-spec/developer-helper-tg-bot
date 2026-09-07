@@ -27,6 +27,7 @@ from dev_helper_bot.memory import (
 )
 from dev_helper_bot.tools import (
     EXEC_TOOL_SPEC,
+    GET_SKILL_TOOL_SPEC,
     LIST_TOOL_SPEC,
     READ_FILE_TOOL_SPEC,
     SEARCH_TOOL_SPEC,
@@ -41,7 +42,13 @@ from tests.conftest import (
     tool_call,
 )
 
-TOOLS = [EXEC_TOOL_SPEC, READ_FILE_TOOL_SPEC, SEARCH_TOOL_SPEC, LIST_TOOL_SPEC]
+TOOLS = [
+    EXEC_TOOL_SPEC,
+    READ_FILE_TOOL_SPEC,
+    GET_SKILL_TOOL_SPEC,
+    SEARCH_TOOL_SPEC,
+    LIST_TOOL_SPEC,
+]
 CHAT_ID = 42
 OTHER_CHAT_ID = 4242
 DATE_IN_BRACKETS = re.compile(r"\[\d{4}-\d{2}-\d{2}\]")
@@ -132,6 +139,57 @@ async def test_read_file_missing_file_error_does_not_break_loop():
     assert reply == "файла нет, но я справился"
     tool_msg = llm.requests[1][2]
     assert "Ошибка чтения файла" in tool_msg["content"]
+
+
+async def test_get_skill_call_returns_body_to_model():
+    from dev_helper_bot.skills import Skill
+
+    skills = {
+        "morning": Skill(
+            name="morning",
+            description="Утро",
+            body="Шаг 1. Погода в Минске\nШаг 2. Habr",
+        )
+    }
+    llm = make_scripted_llm(
+        [
+            assistant_turn(
+                content=None,
+                tool_calls=[
+                    tool_call(
+                        name="get_skill",
+                        arguments='{"name": "morning"}',
+                    )
+                ],
+                finish_reason="tool_calls",
+            ),
+            assistant_turn(content="сводка готова"),
+        ]
+    )
+
+    reply = await run_agent(
+        llm,
+        new_history(),
+        tools=TOOLS,
+        executor=FakeCommandExecutor(),
+        skills=skills,
+    )
+
+    assert reply == "сводка готова"
+    tool_msg = llm.requests[1][2]
+    assert tool_msg["role"] == "tool"
+    assert tool_msg["content"] == skills["morning"].body
+    assert "name:" not in tool_msg["content"]
+    assert "---" not in tool_msg["content"]
+
+
+def test_validate_tool_call_get_skill_requires_name():
+    error = validate_tool_call(
+        tool_call(name="get_skill", arguments="{}"), GET_SKILL_TOOL_SPEC
+    )
+
+    assert error is not None
+    assert '"name"' in error
 
 
 def test_validate_tool_call_read_file_requires_path():
