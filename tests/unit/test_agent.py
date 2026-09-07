@@ -10,6 +10,9 @@ from dev_helper_bot.agent import (
     MAX_LLM_STEPS,
     RESPONSE_TRUNCATED_MESSAGE,
     STEPS_EXHAUSTED_MESSAGE,
+    TOOL_OUTPUT_BUDGET_CHARS,
+    compact_tool_outputs,
+    compacted_tool_stub,
     run_agent,
     validate_final,
     validate_tool_call,
@@ -22,7 +25,13 @@ from dev_helper_bot.memory import (
     ChatHistorySearcher,
     MemoryStore,
 )
-from dev_helper_bot.tools import EXEC_TOOL_SPEC, LIST_TOOL_SPEC, SEARCH_TOOL_SPEC
+from dev_helper_bot.tools import (
+    EXEC_TOOL_SPEC,
+    LIST_TOOL_SPEC,
+    READ_FILE_TOOL_SPEC,
+    SEARCH_TOOL_SPEC,
+    ExecResult,
+)
 
 from tests.conftest import (
     BrokenHistorySearcher,
@@ -32,7 +41,7 @@ from tests.conftest import (
     tool_call,
 )
 
-TOOLS = [EXEC_TOOL_SPEC, SEARCH_TOOL_SPEC, LIST_TOOL_SPEC]
+TOOLS = [EXEC_TOOL_SPEC, READ_FILE_TOOL_SPEC, SEARCH_TOOL_SPEC, LIST_TOOL_SPEC]
 CHAT_ID = 42
 OTHER_CHAT_ID = 4242
 DATE_IN_BRACKETS = re.compile(r"\[\d{4}-\d{2}-\d{2}\]")
@@ -52,6 +61,96 @@ def echo_turn(command: str) -> dict:
         content=None,
         tool_calls=[tool_call(arguments='{"command": "%s"}' % command)],
         finish_reason="tool_calls",
+    )
+
+
+def read_file_turn(
+    path: str = "/work/notes.md",
+    arguments: str | None = None,
+) -> dict:
+    if arguments is None:
+        arguments = f'{{"path": "{path}"}}'
+    return assistant_turn(
+        content=None,
+        tool_calls=[tool_call(name="read_file", arguments=arguments)],
+        finish_reason="tool_calls",
+    )
+
+
+async def test_read_file_call_returns_numbered_lines_to_model():
+    executor = FakeCommandExecutor()
+    executor.files["/work/notes.md"] = "первая\nвторая\nтретья"
+    llm = make_scripted_llm(
+        [
+            read_file_turn(arguments='{"path": "/work/notes.md", "offset": 2, "limit": 1}'),
+            assistant_turn(content="прочитал"),
+        ]
+    )
+
+    reply = await run_agent(llm, new_history(), tools=TOOLS, executor=executor)
+
+    assert reply == "прочитал"
+    tool_msg = llm.requests[1][2]
+    assert tool_msg["role"] == "tool"
+    assert tool_msg["content"].splitlines() == [
+        "2: вторая",
+        "[ответ обрезан: продолжай со строки 3]",
+    ]
+
+
+async def test_file_created_via_exec_is_readable_by_read_file():
+    """Одна песочница: файл из exec виден read_file согласованно."""
+    executor = FakeCommandExecutor()
+    llm = make_scripted_llm(
+        [
+            echo_turn("echo data > note"),
+            read_file_turn(path="note"),
+            assistant_turn(content="прочитал"),
+        ]
+    )
+
+    reply = await run_agent(llm, new_history(), tools=TOOLS, executor=executor)
+
+    assert reply == "прочитал"
+    assert executor.commands == ["echo data > note", "sed -n 1,101p note"]
+    tool_msg = llm.requests[2][4]
+    assert tool_msg["role"] == "tool"
+    assert tool_msg["content"].splitlines() == ["1: data"]
+
+
+async def test_read_file_missing_file_error_does_not_break_loop():
+    executor = FakeCommandExecutor()  # файла нет
+    llm = make_scripted_llm(
+        [
+            read_file_turn(path="/work/nope.md"),
+            assistant_turn(content="файла нет, но я справился"),
+        ]
+    )
+
+    reply = await run_agent(llm, new_history(), tools=TOOLS, executor=executor)
+
+    assert reply == "файла нет, но я справился"
+    tool_msg = llm.requests[1][2]
+    assert "Ошибка чтения файла" in tool_msg["content"]
+
+
+def test_validate_tool_call_read_file_requires_path():
+    error = validate_tool_call(
+        tool_call(name="read_file", arguments="{}"), READ_FILE_TOOL_SPEC
+    )
+
+    assert error is not None
+    assert '"path"' in error
+
+    assert (
+        validate_tool_call(
+            tool_call(
+                name="read_file",
+                arguments='{"path": "/work/a.md", "offset": 2}',
+            ),
+            READ_FILE_TOOL_SPEC,
+        )
+        is None
     )
 
 
@@ -666,3 +765,103 @@ async def test_no_tool_log_records_without_tool_calls(caplog):
     await run_agent(llm, new_history(), tools=TOOLS, executor=FakeCommandExecutor())
 
     assert agent_log_records(caplog) == []
+
+
+# --- Компакция tool-выводов (specs/agent-loop, design D2) ---
+
+
+def big_output_history() -> list[Message]:
+    """Прогон с двумя большими tool-выводами: сумма заметно выше бюджета."""
+    return [
+        {"role": "user", "content": "вопрос"},
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [tool_call(id="call_1", arguments='{"command": "first"}')],
+        },
+        {"role": "tool", "tool_call_id": "call_1", "content": "A" * 5000},
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [tool_call(id="call_2", arguments='{"command": "second"}')],
+        },
+        {"role": "tool", "tool_call_id": "call_2", "content": "B" * 5000},
+    ]
+
+
+def tool_total(history: list[Message]) -> int:
+    return sum(len(m["content"] or "") for m in history if m["role"] == "tool")
+
+
+def test_compact_over_budget_collapses_oldest_first():
+    history = big_output_history()
+
+    compact_tool_outputs(history)
+
+    assert tool_total(history) <= TOOL_OUTPUT_BUDGET_CHARS
+    assert history[2]["content"] == compacted_tool_stub(5000)
+    assert "5000" in history[2]["content"]
+    assert history[4]["content"] == "B" * 5000  # младший вывод цел
+
+
+def test_compact_within_budget_changes_nothing():
+    history = big_output_history()
+    history[2]["content"] = "короткий вывод"
+    history[4]["content"] = "ещё короче"
+    before = [dict(m) for m in history]
+
+    compact_tool_outputs(history)
+
+    assert history == before
+
+
+def test_compact_never_touches_dialog_messages():
+    history = big_output_history()
+
+    compact_tool_outputs(history)
+
+    assert history[0] == {"role": "user", "content": "вопрос"}
+    assert history[1]["tool_calls"][0]["arguments"] == '{"command": "first"}'
+    assert history[3]["tool_calls"][0]["arguments"] == '{"command": "second"}'
+    assert all(m["role"] != "tool" for i, m in enumerate(history) if i in (0, 1, 3))
+
+
+async def test_run_agent_compacts_oldest_tool_output_in_context():
+    """Три exec с выводом ~3000 симв.: на третьем сумма превышает бюджет,
+    старейший вывод в контексте следующего хода — заглушка."""
+    executor = FakeCommandExecutor(
+        default=ExecResult(exit_code=0, stdout="y" * 3000, stderr="")
+    )
+    llm = make_scripted_llm(
+        [
+            echo_turn("big one"),
+            echo_turn("big two"),
+            echo_turn("big three"),
+            assistant_turn(content="готово"),
+        ]
+    )
+
+    reply = await run_agent(llm, new_history(), tools=TOOLS, executor=executor)
+
+    assert reply == "готово"
+    request = llm.requests[3]
+    tool_msgs = [m for m in request if m["role"] == "tool"]
+    assert len(tool_msgs) == 3
+    assert tool_msgs[0]["content"].startswith("[компакция:")
+    assert tool_msgs[1]["content"] != "[компакция:"
+    assert "y" * 100 in tool_msgs[2]["content"]  # самый свежий вывод цел
+    # Команды остались в assistant-сообщениях — повторный вызов возможен
+    assistant_calls = [m for m in request if m.get("tool_calls")]
+    assert len(assistant_calls) == 3
+
+
+async def test_run_agent_keeps_small_tool_outputs_intact():
+    llm = make_scripted_llm(
+        [echo_turn("echo hi"), assistant_turn(content="готово")]
+    )
+
+    await run_agent(llm, new_history(), tools=TOOLS, executor=FakeCommandExecutor())
+
+    tool_msg = llm.requests[1][2]
+    assert "hi" in tool_msg["content"]
+    assert "[компакция:" not in tool_msg["content"]

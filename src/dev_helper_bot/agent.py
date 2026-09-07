@@ -2,22 +2,76 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import Any
+import time
+from typing import TYPE_CHECKING, Any
 
 from dev_helper_bot.llm import LLMClient, Message, ToolCall, ToolSpec
+from dev_helper_bot.telemetry import (
+    RUN_STATUS_STEPS_EXHAUSTED,
+    RUN_STATUS_SUCCESS,
+    RUN_STATUS_VALIDATION_ERROR,
+)
 from dev_helper_bot.tools import (
     EXEC_INFRA_ERROR_PREFIX,
     EXEC_TOOL_NAME,
     LIST_TOOL_NAME,
+    READ_FILE_TOOL_NAME,
     SEARCH_TOOL_NAME,
     CommandExecutor,
     HistorySearcher,
     exec_command,
+    read_file,
 )
+
+if TYPE_CHECKING:
+    from dev_helper_bot.telemetry import RunRecorder
 
 log = logging.getLogger(__name__)
 
 MAX_LLM_STEPS = 8
+
+TOOL_OUTPUT_BUDGET_CHARS = 8000
+"""Символьный бюджет на суммарное содержимое tool-сообщений прогона
+(design D2): сворачивает только аномально разросшиеся прогоны."""
+
+COMPACTED_TOOL_OUTPUT_PREFIX = "[компакция:"
+
+
+def compacted_tool_stub(size: int) -> str:
+    return (
+        f"[компакция: вывод обрезан, было {size} симв.; "
+        "вызови инструмент повторно при необходимости]"
+    )
+
+
+def compact_tool_outputs(
+    history: list[Message], budget: int = TOOL_OUTPUT_BUDGET_CHARS
+) -> None:
+    """Свёртка старейших tool-выводов при превышении бюджета (design D2).
+
+    Команда вызова не дублируется в заглушке: она остаётся в соседнем
+    assistant-сообщении с tool_calls, которое не компактируется.
+    user/assistant-сообщения не трогаются; уже свёрнутое и слишком
+    короткое (заглушка длиннее вывода) не сворачивается повторно.
+    """
+    total = sum(
+        len(m.get("content") or "")
+        for m in history
+        if m.get("role") == "tool"
+    )
+    for message in history:
+        if total <= budget:
+            break
+        if message.get("role") != "tool":
+            continue
+        content = message.get("content") or ""
+        if content.startswith(COMPACTED_TOOL_OUTPUT_PREFIX):
+            continue
+        stub = compacted_tool_stub(len(content))
+        if len(stub) >= len(content):
+            continue
+        message["content"] = stub
+        total -= len(content) - len(stub)
 
 STEPS_EXHAUSTED_MESSAGE = (
     "Не смог получить ответ за отведённое число шагов "
@@ -154,11 +208,23 @@ async def execute_tool_call(
             return await history_search.list_sessions(), True
         except Exception as exc:
             return f"Ошибка выполнения инструмента: {exc}", False
+    if call["name"] == READ_FILE_TOOL_NAME:
+        arguments = json.loads(call["arguments"] or "{}")
+        try:
+            result = await read_file(
+                executor,
+                arguments["path"],
+                arguments.get("offset"),
+                arguments.get("limit"),
+            )
+        except Exception as exc:
+            return f"Ошибка выполнения инструмента: {exc}", False
+        return result, not result.startswith(EXEC_INFRA_ERROR_PREFIX)
     if call["name"] != EXEC_TOOL_NAME:
         return (
             f"Ошибка: неизвестный инструмент {call['name']!r}. "
-            f"Доступны {EXEC_TOOL_NAME!r}, {SEARCH_TOOL_NAME!r} "
-            f"и {LIST_TOOL_NAME!r}.",
+            f"Доступны {EXEC_TOOL_NAME!r}, {READ_FILE_TOOL_NAME!r}, "
+            f"{SEARCH_TOOL_NAME!r} и {LIST_TOOL_NAME!r}.",
             False,
         )
     arguments = json.loads(call["arguments"] or "{}")
@@ -176,6 +242,7 @@ async def run_agent(
     *,
     executor: CommandExecutor,
     history_search: HistorySearcher | None = None,
+    recorder: RunRecorder | None = None,
 ) -> str:
     """Агентный цикл: LLM → валидация хода → tool_calls → результаты в историю → повтор.
 
@@ -193,13 +260,23 @@ async def run_agent(
     Исполнитель команд передаётся готовым и переживает сообщения:
     жизненным циклом песочницы владеет main (design D5) — контейнер-жилец
     создаётся при первом exec и удаляется при завершении процесса бота.
+
+    `recorder` — опциональная телеметрия прогона (design D2/D3): tool-вызовы
+    фиксируются в точке формирования tool-сообщения (имя, размеры, длительность,
+    исход — включая отказ валидации с нулевой длительностью), терминальные
+    возвраты финализируют прогон статусом. Телеметрия best-effort и не влияет
+    на ответы модели и исполнение инструментов.
     """
     specs_by_name: dict[str, ToolSpec] = {
         (spec.get("function") or {}).get("name"): spec for spec in tools or []
     }
     validation_failures = 0
 
-    for _ in range(MAX_LLM_STEPS):
+    async def finalize(status: str) -> None:
+        if recorder is not None:
+            await recorder.finish(status)
+
+    for turn_number in range(1, MAX_LLM_STEPS + 1):
         turn = await llm.complete(history, tools)
 
         if turn["tool_calls"]:
@@ -213,10 +290,12 @@ async def run_agent(
         # Сначала валидация, потом finish_reason (design D4): ретраи
         # не чинят обрыв генерации, валидный ответ при length принимается.
         if failed and turn["finish_reason"] == "length":
+            await finalize(RUN_STATUS_VALIDATION_ERROR)
             return RESPONSE_TRUNCATED_MESSAGE
         if failed:
             validation_failures += 1
             if validation_failures >= MAX_JSON_RETRIES:
+                await finalize(RUN_STATUS_VALIDATION_ERROR)
                 return JSON_RETRIES_EXHAUSTED_MESSAGE
         else:
             validation_failures = 0
@@ -230,6 +309,7 @@ async def run_agent(
                 continue
             reply = turn["content"] or ""
             history.append({"role": "assistant", "content": reply})
+            await finalize(RUN_STATUS_SUCCESS)
             return reply
 
         history.append(
@@ -245,14 +325,34 @@ async def run_agent(
                     "tool %s rejected by validation: %s", call["name"], error
                 )
                 result = error
+                if recorder is not None:
+                    await recorder.record_tool_call(
+                        turn_number=turn_number,
+                        tool_name=call["name"],
+                        input_size=len(call["arguments"] or ""),
+                        output_size=len(result),
+                        duration_ms=0.0,
+                        ok=False,
+                    )
             else:
+                tool_started = time.perf_counter()
                 result, succeeded = await execute_tool_call(
                     call, executor, history_search
                 )
+                duration_ms = (time.perf_counter() - tool_started) * 1000
                 if succeeded:
                     log.info("tool %s: success", call["name"])
                 else:
                     log.info("tool %s: execution error", call["name"])
+                if recorder is not None:
+                    await recorder.record_tool_call(
+                        turn_number=turn_number,
+                        tool_name=call["name"],
+                        input_size=len(call["arguments"] or ""),
+                        output_size=len(result),
+                        duration_ms=duration_ms,
+                        ok=succeeded,
+                    )
             history.append(
                 {
                     "role": "tool",
@@ -260,4 +360,8 @@ async def run_agent(
                     "content": result,
                 }
             )
+        # Бюджет tool-выводов прогона (design D2): новые результаты могут
+        # вывести сумму за бюджет — старейшие сворачиваются в заглушки.
+        compact_tool_outputs(history)
+    await finalize(RUN_STATUS_STEPS_EXHAUSTED)
     return STEPS_EXHAUSTED_MESSAGE

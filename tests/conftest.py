@@ -82,11 +82,13 @@ def assistant_turn(
     content: str | None = "ok",
     tool_calls: list[ToolCall] | None = None,
     finish_reason: str = "stop",
+    usage: dict | None = None,
 ) -> AssistantTurn:
     return {
         "content": content,
         "tool_calls": tool_calls or [],
         "finish_reason": finish_reason,
+        "usage": usage,
     }
 
 
@@ -102,9 +104,9 @@ class FakeCommandExecutor:
     """Двойник CommandExecutor: жизнь без Docker и сети.
 
     Симулирует файловое состояние долгоживущего контейнера-жителя для команд
-    вида `echo text > file` / `cat file` (состояние переживает вызовы),
-    а также `echo text` и `exit N`; остальные команды возвращают
-    scripted-результат (или default).
+    вида `echo text > file` / `cat file` / `sed -n A,Bp file` (состояние
+    переживает вызовы), а также `echo text` и `exit N`; остальные команды
+    возвращают scripted-результат (или default).
     """
 
     def __init__(
@@ -145,6 +147,30 @@ class FakeCommandExecutor:
                 exit_code=1,
                 stdout="",
                 stderr=f"cat: can't open '{cat[1]}': No such file or directory",
+            )
+        sed = re.fullmatch(r"sed -n (\d+),(\d+)p (\S+)", command)
+        if sed:
+            start, end, path = int(sed[1]), int(sed[2]), sed[3]
+            if path in self.files:
+                picked = self.files[path].splitlines()[start - 1 : end]
+                stdout = "".join(f"{line}\n" for line in picked)
+                return ExecResult(exit_code=0, stdout=stdout, stderr="")
+            return ExecResult(
+                exit_code=1,
+                stdout="",
+                stderr=f"sed: can't read '{path}': No such file or directory",
+            )
+        head = re.fullmatch(r"head -n (\d+) (\S+)", command)
+        if head:
+            count, path = int(head[1]), head[2]
+            if path in self.files:
+                picked = self.files[path].splitlines()[:count]
+                stdout = "".join(f"{line}\n" for line in picked)
+                return ExecResult(exit_code=0, stdout=stdout, stderr="")
+            return ExecResult(
+                exit_code=1,
+                stdout="",
+                stderr=f"head: can't open '{path}': No such file or directory",
             )
         exit_code = re.fullmatch(r"exit (\d+)", command)
         if exit_code:

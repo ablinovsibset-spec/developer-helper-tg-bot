@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sqlite3
 from datetime import datetime
 
 import pytest
@@ -32,18 +33,19 @@ CHAT_ID = 42
 SKILLS = {"wttr-in-api": "Правила wttr.in"}
 T1 = datetime(2026, 8, 28, 7, 45)
 T2 = datetime(2026, 8, 28, 7, 47)
-SYSTEM_AT_T1 = (
-    "Reasoning: medium\nТекущие дата и время: 2026-08-28 07:45 (пятница)"
+SYSTEM = (
+    "Reasoning: medium"
     f"\n{SANDBOX_ENV_LINE}"
     f"\n{MEMORY_ENV_LINE}"
     "\n\n## wttr-in-api\nПравила wttr.in"
 )
-SYSTEM_AT_T2 = (
-    "Reasoning: medium\nТекущие дата и время: 2026-08-28 07:47 (пятница)"
-    f"\n{SANDBOX_ENV_LINE}"
-    f"\n{MEMORY_ENV_LINE}"
-    "\n\n## wttr-in-api\nПравила wttr.in"
-)
+TIME_AT_T1 = "Текущие дата и время: 2026-08-28 07:45 (пятница)"
+TIME_AT_T2 = "Текущие дата и время: 2026-08-28 07:47 (пятница)"
+
+
+def user_at(moment: str, text: str) -> dict:
+    """Текущее user-сообщение с контекстной строкой времени (design D3)."""
+    return {"role": "user", "content": f"{moment}\n{text}"}
 
 
 def fake_datetime(*times: datetime):
@@ -99,8 +101,8 @@ async def test_handle_text_prompt_goes_to_llm_with_system_and_tools(
     await handle(FakeMessage("привет", chat_id=CHAT_ID), fake_bot, llm, store)
 
     assert llm.requests[0] == [
-        {"role": "system", "content": SYSTEM_AT_T1},
-        {"role": "user", "content": "привет"},
+        {"role": "system", "content": SYSTEM},
+        user_at(TIME_AT_T1, "привет"),
     ]
     assert llm.tools_per_request == [AGENT_TOOLS]
 
@@ -129,17 +131,20 @@ async def test_context_is_kept_between_messages(fake_bot, store, monkeypatch):
     llm.turns = [assistant_turn("второй ответ")]
     await handle(FakeMessage("второе", chat_id=CHAT_ID), fake_bot, llm, store)
 
+    # История из памяти — без строк времени; строка только в текущем сообщении
     assert llm.requests[1] == [
-        {"role": "system", "content": SYSTEM_AT_T2},
+        {"role": "system", "content": SYSTEM},
         {"role": "user", "content": "первое"},
         {"role": "assistant", "content": "первый ответ"},
-        {"role": "user", "content": "второе"},
+        user_at(TIME_AT_T2, "второе"),
     ]
 
 
-async def test_system_message_is_refreshed_between_messages(
+async def test_datetime_line_refreshed_and_prefix_stable_between_messages(
     fake_bot, store, monkeypatch
 ):
+    """Строка времени обновляется на каждом сообщении (design D3), а префикс
+    system+история остаётся байтово стабильным (спека skills)."""
     llm = make_llm_stub(reply="первый ответ")
     monkeypatch.setattr(main_module, "datetime", fake_datetime(T1, T2))
     await handle(
@@ -149,14 +154,35 @@ async def test_system_message_is_refreshed_between_messages(
     llm.turns = [assistant_turn("второй ответ")]
     await handle(FakeMessage("второе", chat_id=CHAT_ID), fake_bot, llm, store)
 
-    assert llm.requests[0][0] == {"role": "system", "content": SYSTEM_AT_T1}
-    assert llm.requests[1][0] == {"role": "system", "content": SYSTEM_AT_T2}
-    assert [m["role"] for m in llm.requests[1]] == [
-        "system",
-        "user",
-        "assistant",
-        "user",
-    ]
+    first, second = llm.requests[0], llm.requests[1]
+    assert TIME_AT_T1 in first[1]["content"]
+    assert TIME_AT_T2 in second[3]["content"]
+    # Префикс второго запроса = system + загруженная история — байтово тот же
+    assert second[0] == first[0] == {"role": "system", "content": SYSTEM}
+    assert "Текущие дата и время" not in second[1]["content"]
+
+
+async def test_prefix_stable_within_agent_run(fake_bot, store, monkeypatch):
+    """Прогоны цикла начинают каждый следующий запрос тем же префиксом,
+    дополненным новыми сообщениями (спека skills)."""
+    monkeypatch.setattr(main_module, "datetime", fake_datetime(T1))
+    llm = make_scripted_llm(
+        [
+            assistant_turn(
+                content=None,
+                tool_calls=[tool_call(arguments='{"command": "echo hi"}')],
+                finish_reason="tool_calls",
+            ),
+            assistant_turn(content="готово"),
+        ]
+    )
+
+    await handle(FakeMessage("запрос", chat_id=CHAT_ID), fake_bot, llm, store)
+
+    assert len(llm.requests) == 2
+    first, second = llm.requests
+    assert second[: len(first)] == first
+    assert [m["role"] for m in second[len(first):]] == ["assistant", "tool"]
 
 
 async def test_tool_transcript_in_flight_but_not_persisted(fake_bot, store):
@@ -220,10 +246,10 @@ async def test_context_survives_bot_restart(fake_bot, tmp_path, monkeypatch):
     await second_store.close()
 
     assert llm.requests[2] == [
-        {"role": "system", "content": SYSTEM_AT_T2},
+        {"role": "system", "content": SYSTEM},
         {"role": "user", "content": "первое"},
         {"role": "assistant", "content": "первый ответ"},
-        {"role": "user", "content": "второе"},
+        user_at(TIME_AT_T2, "второе"),
     ]
     assert not any(
         m["role"] in ("tool",) or "tool_calls" in m
@@ -250,8 +276,8 @@ async def test_new_command_closes_session_without_llm_call(
     await handle(FakeMessage("второе", chat_id=CHAT_ID), fake_bot, llm, store)
 
     assert llm.requests[0] == [
-        {"role": "system", "content": SYSTEM_AT_T2},
-        {"role": "user", "content": "второе"},
+        {"role": "system", "content": SYSTEM},
+        user_at(TIME_AT_T2, "второе"),
     ]
     # Прошлая сессия осталась в хранилище и доступна поиску
     assert "первое" in await store.search_completed(CHAT_ID, "первое")
@@ -280,7 +306,7 @@ async def test_chats_are_isolated_in_handler(fake_bot, store, monkeypatch):
     await handle(FakeMessage("секрет б", chat_id=2), fake_bot, llm, store)
 
     assert [m["role"] for m in llm.requests[1]] == ["system", "user"]
-    assert llm.requests[1][1]["content"] == "секрет б"
+    assert "секрет б" in llm.requests[1][1]["content"]
     assert "секрет а" not in str(llm.requests[1])
 
 
@@ -411,6 +437,23 @@ async def test_main_opens_and_closes_memory_store(fake_bot, monkeypatch, tmp_pat
     monkeypatch.setattr(main_module, "prepare_sandbox_environment", fake_prepare)
     monkeypatch.setattr(main_module, "SandboxExecutor", lambda: executor)
     monkeypatch.setattr(main_module, "memory_db_path", lambda: str(tmp_path / "m.db"))
+    monkeypatch.setattr(main_module, "obs_db_path", lambda: str(tmp_path / "obs.db"))
+    monkeypatch.setattr(main_module, "obs_web_port", lambda: 8765)
+    # Веб-дашборд — заглушки lifecycle, чтобы не открывать реальный порт в тестах
+    monkeypatch.setattr(main_module, "build_app", lambda store, **kw: ("web_app", store))
+    web_runner = object()
+
+    async def fake_start_app(app, *, host=None, port=None):
+        events.append("web_started")
+        assert app[0] == "web_app"
+        return web_runner
+
+    async def fake_stop_app(runner):
+        events.append("web_stopped")
+        assert runner is web_runner
+
+    monkeypatch.setattr(main_module, "start_app", fake_start_app)
+    monkeypatch.setattr(main_module, "stop_app", fake_stop_app)
     monkeypatch.setattr(main_module, "Bot", FakeMainBot)
     monkeypatch.setattr(
         main_module.Dispatcher, "start_polling", FakeDispatcher.start_polling
@@ -419,7 +462,11 @@ async def test_main_opens_and_closes_memory_store(fake_bot, monkeypatch, tmp_pat
     with pytest.raises(RuntimeError, match="polling stopped"):
         await main_module.main()
 
-    assert events == ["bot_created", "prepared", "polling", "session_closed"]
+    # Веб стартует до polling и останавливается в finally (design D1)
+    assert events == [
+        "bot_created", "prepared", "web_started", "polling",
+        "web_stopped", "session_closed",
+    ]
     assert executor.stop_calls == 1  # best-effort stop при завершении бота
     # Store закрыт: переоткрытие того же файла видит записанное
     reopened = MemoryStore(tmp_path / "m.db")
@@ -430,3 +477,60 @@ async def test_main_opens_and_closes_memory_store(fake_bot, monkeypatch, tmp_pat
         ]
     finally:
         await reopened.close()
+    # БД телеметрии создана со схемой (store открыт и закрыт main'ом)
+    assert (tmp_path / "obs.db").exists()
+    with sqlite3.connect(tmp_path / "obs.db") as conn:
+        tables = {
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
+        }
+    assert {"runs", "llm_calls", "tool_calls"} <= tables
+
+
+async def test_main_busy_web_port_stops_before_polling(fake_bot, monkeypatch, tmp_path):
+    """Сбой bind порта дашборда — fail-fast: polling не стартует, понятная причина
+    (design D2, task 3.2)."""
+    import dev_helper_bot.main as main_module
+
+    executor = FakeCommandExecutor()
+    polling_started = []
+
+    class FakeSession:
+        async def close(self) -> None: ...
+
+    class FakeMainBot:
+        def __init__(self, token: str, default=None) -> None:
+            self.session = FakeSession()
+
+    class FakeDispatcher(main_module.Dispatcher):
+        async def start_polling(self, bot) -> None:
+            polling_started.append(True)
+            raise AssertionError("polling must not start when web port is busy")
+
+    async def fake_prepare() -> None: ...
+
+    async def fake_start_app(app, *, host=None, port=None):
+        raise OSError("address already in use")
+
+    monkeypatch.setattr(main_module, "load_dotenv", lambda: None)
+    monkeypatch.setattr(main_module, "telegram_token", lambda: "test-token")
+    monkeypatch.setattr(main_module, "make_llm", lambda: fake_bot)
+    monkeypatch.setattr(main_module, "prepare_sandbox_environment", fake_prepare)
+    monkeypatch.setattr(main_module, "SandboxExecutor", lambda: executor)
+    monkeypatch.setattr(main_module, "memory_db_path", lambda: str(tmp_path / "m.db"))
+    monkeypatch.setattr(main_module, "obs_db_path", lambda: str(tmp_path / "obs.db"))
+    monkeypatch.setattr(main_module, "obs_web_port", lambda: 8765)
+    monkeypatch.setattr(main_module, "build_app", lambda store, **kw: "web_app")
+    monkeypatch.setattr(main_module, "start_app", fake_start_app)
+    monkeypatch.setattr(main_module, "stop_app", lambda r: None)
+    monkeypatch.setattr(main_module, "Bot", FakeMainBot)
+    monkeypatch.setattr(
+        main_module.Dispatcher, "start_polling", FakeDispatcher.start_polling
+    )
+
+    with pytest.raises(OSError, match="address already in use"):
+        await main_module.main()
+
+    assert polling_started == []  # polling не стартовал

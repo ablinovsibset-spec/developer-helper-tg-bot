@@ -8,6 +8,7 @@ from dev_helper_bot.skills import (
     REASONING_EFFORT_LINE,
     SANDBOX_ENV_LINE,
     WEEKDAYS,
+    build_request_messages,
     build_system_prompt,
     datetime_line,
     load_skills,
@@ -71,34 +72,38 @@ def test_datetime_line_weekday_for_each_day():
     ]
 
 
-def test_build_system_prompt_contains_reasoning_datetime_and_sections(tmp_path):
+def test_build_system_prompt_contains_reasoning_env_and_sections(tmp_path):
     skills = load_skills(make_skills_dir(tmp_path))
-    now = datetime(2026, 8, 28, 7, 45)
 
-    prompt = build_system_prompt(skills, now)
+    prompt = build_system_prompt(skills)
 
-    assert prompt.startswith(
-        f"{REASONING_EFFORT_LINE}\nТекущие дата и время: 2026-08-28 07:45 (пятница)"
-    )
+    assert prompt.startswith(f"{REASONING_EFFORT_LINE}\n{SANDBOX_ENV_LINE}")
     assert SANDBOX_ENV_LINE in prompt
     assert "## wttr-in-api\nПравила wttr.in" in prompt
     assert "## morning\nУтро: погода Минск" in prompt
 
 
-def test_build_system_prompt_without_skills_is_reasoning_datetime_and_env():
-    prompt = build_system_prompt({}, datetime(2026, 8, 28, 7, 45))
+def test_build_system_prompt_has_no_datetime_line(tmp_path):
+    """Дата/время ушли из системного промпта (design D3): префикс стабилен."""
+    skills = load_skills(make_skills_dir(tmp_path))
+
+    prompt = build_system_prompt(skills)
+
+    assert "Текущие дата и время" not in prompt
+
+
+def test_build_system_prompt_without_skills_is_reasoning_and_env():
+    prompt = build_system_prompt({})
 
     assert prompt == (
-        "Reasoning: medium\nТекущие дата и время: 2026-08-28 07:45 (пятница)"
-        f"\n{SANDBOX_ENV_LINE}"
-        f"\n{MEMORY_ENV_LINE}"
+        f"{REASONING_EFFORT_LINE}\n{SANDBOX_ENV_LINE}\n{MEMORY_ENV_LINE}"
     )
 
 
 def test_memory_env_line_present_in_prompt_with_skills(tmp_path):
     skills = load_skills(make_skills_dir(tmp_path))
 
-    prompt = build_system_prompt(skills, datetime(2026, 8, 28, 7, 45))
+    prompt = build_system_prompt(skills)
 
     assert MEMORY_ENV_LINE in prompt
 
@@ -110,23 +115,16 @@ def test_memory_env_line_present_in_prompt_with_empty_skills():
 
 
 def test_memory_env_line_goes_right_after_sandbox_env_line():
-    prompt = build_system_prompt({}, datetime(2026, 8, 28, 7, 45))
+    prompt = build_system_prompt({})
 
     assert prompt.index(SANDBOX_ENV_LINE) < prompt.index(MEMORY_ENV_LINE)
 
 
-def test_build_system_prompt_default_now_does_not_crash():
-    prompt = build_system_prompt({})
-
-    assert prompt.startswith(REASONING_EFFORT_LINE + "\nТекущие дата и время: ")
-    assert "(" in prompt  # день недели присутствует
-
-
 def test_system_prompt_from_dir_end_to_end(tmp_path):
-    prompt = system_prompt_from_dir(make_skills_dir(tmp_path), datetime(2026, 8, 28, 7, 45))
+    prompt = system_prompt_from_dir(make_skills_dir(tmp_path))
 
     assert prompt.startswith("Reasoning: medium")
-    assert "Текущие дата и время: 2026-08-28 07:45 (пятница)" in prompt
+    assert "Текущие дата и время" not in prompt
     assert "wttr-in-api" in prompt
     assert "morning" in prompt
 
@@ -134,10 +132,56 @@ def test_system_prompt_from_dir_end_to_end(tmp_path):
 def test_sandbox_env_line_reflects_persistent_state():
     """Промпт сообщает модели персистентность: файлы/пакеты переживают
     сообщения и /new; сброс — только пересозданием контейнера."""
-    prompt = build_system_prompt({}, datetime(2026, 8, 28, 7, 45))
+    prompt = build_system_prompt({})
 
     assert "переживают сообщения" in prompt
     assert "/new" in prompt
     assert "пересозданием контейнера" in prompt
     # Прошлая формулировка «до конца сообщения» противоречит жителю.
     assert "до конца обработки" not in prompt
+
+
+# --- Сборка запроса: контекстная строка и стабильный префикс (design D3/D4) ---
+
+T1 = datetime(2026, 8, 28, 7, 45)
+T2 = datetime(2026, 8, 28, 7, 47)
+SESSION_HISTORY = [
+    {"role": "user", "content": "старый вопрос"},
+    {"role": "assistant", "content": "старый ответ"},
+]
+
+
+def test_build_request_messages_places_datetime_in_current_user_message():
+    messages = build_request_messages({}, [], "новый вопрос", T1)
+
+    assert messages == [
+        {"role": "system", "content": build_system_prompt({})},
+        {
+            "role": "user",
+            "content": "Текущие дата и время: 2026-08-28 07:45 (пятница)"
+            "\nновый вопрос",
+        },
+    ]
+
+
+def test_build_request_messages_puts_history_before_current_message():
+    messages = build_request_messages({}, SESSION_HISTORY, "вопрос", T1)
+
+    assert [m["role"] for m in messages] == ["system", "user", "assistant", "user"]
+    assert messages[1] == SESSION_HISTORY[0]
+    assert messages[2] == SESSION_HISTORY[1]
+    assert messages[3]["content"].endswith("вопрос")
+
+
+def test_build_request_messages_prefix_is_byte_stable_between_messages():
+    first = build_request_messages({}, SESSION_HISTORY, "первое", T1)
+    second = build_request_messages(
+        {}, SESSION_HISTORY + [{"role": "user", "content": "первое"}], "второе", T2
+    )
+
+    # system + загруженная история идентичны — меняется только хвост
+    assert second[:3] == first[:3]
+    # Время обновилось в текущем сообщении, история не содержит строки времени
+    assert "07:45" in first[3]["content"]
+    assert "07:47" in second[4]["content"]
+    assert "Текущие дата и время" not in second[1]["content"]

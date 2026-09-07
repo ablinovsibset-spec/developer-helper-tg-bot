@@ -12,14 +12,33 @@ from aiogram.types import Message as TgMessage
 from dotenv import load_dotenv
 
 from dev_helper_bot.agent import run_agent
-from dev_helper_bot.config import make_llm, memory_db_path, telegram_token
+from dev_helper_bot.config import (
+    llm_model_name,
+    make_llm,
+    memory_db_path,
+    obs_db_path,
+    obs_label,
+    obs_price_input_per_m,
+    obs_price_output_per_m,
+    obs_web_host,
+    obs_web_port,
+    telegram_token,
+)
 from dev_helper_bot.llm import LLMClient, LLMUnavailable, Message
 from dev_helper_bot.memory import ChatHistorySearcher, MemoryStore
+from dev_helper_bot.obs_web import build_app, start_app, stop_app
 from dev_helper_bot.sandbox import SandboxExecutor, prepare_sandbox_environment
-from dev_helper_bot.skills import build_system_prompt, default_skills_dir, load_skills
+from dev_helper_bot.skills import build_request_messages, default_skills_dir, load_skills
+from dev_helper_bot.telemetry import (
+    RUN_STATUS_LLM_ERROR,
+    ObservingClient,
+    RunRecorder,
+    TelemetryStore,
+)
 from dev_helper_bot.tools import (
     EXEC_TOOL_SPEC,
     LIST_TOOL_SPEC,
+    READ_FILE_TOOL_SPEC,
     SEARCH_TOOL_SPEC,
     CommandExecutor,
 )
@@ -28,7 +47,12 @@ TELEGRAM_MESSAGE_LIMIT = 4096
 WAITING_MESSAGE = "⏳ Готовлю ответ…"
 NEW_CHAT_CONFIRMATION = "🆕 Контекст сброшен — начинаем новый диалог."
 
-AGENT_TOOLS = [EXEC_TOOL_SPEC, SEARCH_TOOL_SPEC, LIST_TOOL_SPEC]
+AGENT_TOOLS = [
+    EXEC_TOOL_SPEC,
+    READ_FILE_TOOL_SPEC,
+    SEARCH_TOOL_SPEC,
+    LIST_TOOL_SPEC,
+]
 
 logging.basicConfig(
     level=logging.INFO,
@@ -50,28 +74,52 @@ async def handle_text(
     memory: MemoryStore,
     skills: dict[str, str],
     executor: CommandExecutor,
+    telemetry: TelemetryStore | None = None,
 ) -> None:
     chat_id = message.chat.id
     user_text = message.text or ""
     # Канон — БД (design D4): контекст открытой сессии восстанавливается из
     # хранилища, транскрипт инструментов живёт только в рамках этой обработки.
-    system_prompt = build_system_prompt(skills, datetime.now())
-    history: list[Message] = [{"role": "system", "content": system_prompt}]
-    history += await memory.load_open_history(chat_id)
+    # Сборка запроса — единый шов skills.build_request_messages (design D4):
+    # стабильный системный промпт + история + текущее сообщение с контекстной
+    # строкой времени (в память не персистится).
+    session_history = await memory.load_open_history(chat_id)
+    history: list[Message] = build_request_messages(
+        skills, session_history, user_text, datetime.now()
+    )
     await memory.append_user(chat_id, user_text)
-    history.append({"role": "user", "content": user_text})
+
+    # Телеметрия прогона (design D2): recorder на каждое сообщение, LLM —
+    # в наблюдающей обёртке. Телеметрия best-effort и не влияет на ответы.
+    recorder: RunRecorder | None = None
+    client = llm
+    if telemetry is not None:
+        recorder = RunRecorder(
+            telemetry,
+            chat_id,
+            obs_label(),
+            price_input_per_m=obs_price_input_per_m(),
+            price_output_per_m=obs_price_output_per_m(),
+        )
+        await recorder.start()
+        client = ObservingClient(llm, recorder, model=llm_model_name())
 
     await bot.send_message(chat_id=chat_id, text=WAITING_MESSAGE)
     try:
         reply = await run_agent(
-            llm,
+            client,
             history,
             tools=AGENT_TOOLS,
             executor=executor,
             history_search=ChatHistorySearcher(memory, chat_id),
+            recorder=recorder,
         )
     except LLMUnavailable as exc:
         log.warning("LLM unavailable: %s", exc)
+        # Ветка LLMUnavailable финализируется здесь (design D2): run_agent
+        # терминальные возвраты закрывает сам, исключение проходит мимо.
+        if recorder is not None:
+            await recorder.finish(RUN_STATUS_LLM_ERROR)
         await bot.send_message(
             chat_id=chat_id,
             text=(
@@ -102,23 +150,49 @@ async def main() -> None:
     executor = SandboxExecutor()
     memory = MemoryStore(memory_db_path())
     await memory.open()
-    dp = Dispatcher()
-    dp["llm"] = llm
-    dp["memory"] = memory
-    dp["skills"] = load_skills(default_skills_dir())
-    dp["executor"] = executor
-    dp.message.register(handle_new, Command("new"))
-    dp.message.register(handle_text, F.text)
-
-    log.info("Bot started. Long-polling…")
+    # Телеметрия — тот же паттерн владения, что у памяти (design D4);
+    # сбой открытия не роняет бота: наблюдение не может стать причиной отказа.
+    telemetry: TelemetryStore | None = TelemetryStore(obs_db_path())
     try:
+        await telemetry.open()
+    except Exception:
+        log.warning("telemetry disabled: cannot open %s", obs_db_path(), exc_info=True)
+        telemetry = None
+    # Веб-дашборд (change add-obs-web-dashboard, design D1/D2): in-process
+    # aiohttp на loopback. Сбой bind (занятый порт) — fail-fast: исключение
+    # до polling с понятной причиной. Сбой телеметрии — soft: веб жив и отдаёт
+    # заглушку «телеметрия недоступна». Цены для аудита — те же, что у recorder.
+    # Весь lifecycle (веб + polling + ресурсы) — в одном try/finally, чтобы
+    # при сбое bind порта закрыть memory/telemetry, а не оставить открытыми.
+    web_app = build_app(
+        telemetry,
+        price_input_per_m=obs_price_input_per_m(),
+        price_output_per_m=obs_price_output_per_m(),
+    )
+    web_runner = None
+    try:
+        web_runner = await start_app(web_app, host=obs_web_host(), port=obs_web_port())
+        dp = Dispatcher()
+        dp["llm"] = llm
+        dp["memory"] = memory
+        dp["telemetry"] = telemetry
+        dp["skills"] = load_skills(default_skills_dir())
+        dp["executor"] = executor
+        dp.message.register(handle_new, Command("new"))
+        dp.message.register(handle_text, F.text)
+
+        log.info("Bot started. Long-polling…")
         await dp.start_polling(bot)
     finally:
         # Контейнер-жильца убираем best-effort: ошибки удаления не должны
         # прерывать завершение (спека docker-sandbox). Оставшийся после
         # аварийного завершения контейнер подберёт sweep при следующем старте.
+        if web_runner is not None:
+            await stop_app(web_runner)
         await executor.stop()
         await memory.close()
+        if telemetry is not None:
+            await telemetry.close()
         await bot.session.close()
 
 

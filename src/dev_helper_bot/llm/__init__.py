@@ -6,6 +6,7 @@ from .base import (
     ResponseFormat,
     ToolCall,
     ToolSpec,
+    Usage,
 )
 from .openai_compat import OpenAICompatibleClient
 
@@ -18,4 +19,5 @@ __all__ = [
     "ResponseFormat",
     "ToolCall",
     "ToolSpec",
+    "Usage",
 ]

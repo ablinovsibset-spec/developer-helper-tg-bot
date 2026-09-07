@@ -3,6 +3,8 @@ from __future__ import annotations
 from datetime import datetime
 from pathlib import Path
 
+from dev_helper_bot.llm import Message
+
 REASONING_EFFORT_LINE = "Reasoning: medium"
 SKILLS_DIR_NAME = "skills"
 
@@ -55,22 +57,44 @@ def load_skills(skills_dir: Path) -> dict[str, str]:
 
 
 def datetime_line(now: datetime) -> str:
-    """Строка даты/времени для промпта: дата, минуты и день недели."""
+    """Контекстная строка даты/времени: дата, минуты и день недели."""
     return f"Текущие дата и время: {now:%Y-%m-%d %H:%M} ({WEEKDAYS[now.weekday()]})"
 
 
-def build_system_prompt(skills: dict[str, str], now: datetime | None = None) -> str:
-    """Склейка системного промпта: reasoning, дата/время, секции скиллов."""
-    if now is None:
-        now = datetime.now()
-    sections = [
-        f"{REASONING_EFFORT_LINE}\n{datetime_line(now)}"
-        f"\n{SANDBOX_ENV_LINE}\n{MEMORY_ENV_LINE}"
-    ]
+def build_system_prompt(skills: dict[str, str]) -> str:
+    """Склейка системного промпта: reasoning, окружение, секции скиллов.
+
+    Без даты/времени (design D3): системный промпт байтово стабилен между
+    сообщениями сессии — кэшируемый префикс не ломается.
+    """
+    sections = [f"{REASONING_EFFORT_LINE}\n{SANDBOX_ENV_LINE}\n{MEMORY_ENV_LINE}"]
     for name, content in skills.items():
         sections.append(f"## {name}\n{content}")
     return "\n\n".join(sections)
 
 
-def system_prompt_from_dir(skills_dir: Path, now: datetime | None = None) -> str:
-    return build_system_prompt(load_skills(skills_dir), now)
+def system_prompt_from_dir(skills_dir: Path) -> str:
+    return build_system_prompt(load_skills(skills_dir))
+
+
+def build_request_messages(
+    skills: dict[str, str],
+    session_history: list[Message],
+    user_text: str,
+    now: datetime | None = None,
+) -> list[Message]:
+    """Единая сборка контекста запроса (design D4): system + загруженная
+    история сессии + текущее user-сообщение с контекстной строкой времени.
+
+    Контекстная строка даты/времени живёт только в текущем сообщении
+    (design D3): не персистится в память, внутри прогона неизменна,
+    между прогонами — свежая. Префикс «system + история» байтово
+    стабилен, пока не меняются скиллы.
+    """
+    if now is None:
+        now = datetime.now()
+    return [
+        {"role": "system", "content": build_system_prompt(skills)},
+        *session_history,
+        {"role": "user", "content": f"{datetime_line(now)}\n{user_text}"},
+    ]
