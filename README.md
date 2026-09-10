@@ -30,7 +30,7 @@ Telegram-бот — минимальный автономный агент: пе
    | Переменная | По умолчанию | Описание |
    |---|---|---|
    | `LLM_PROVIDER` | `openai_compatible` | Провайдер (LM Studio, Ollama /v1, vLLM, OpenAI) |
-   | `LLM_BASE_URL` | `http://localhost:1234/v1` | Адрес OpenAI-совместимого endpoint'а (для запуска внутри сандбока переопределяется скриптом запуска на `host.docker.internal`) |
+   | `LLM_BASE_URL` | `http://localhost:1234/v1` | Адрес OpenAI-совместимого endpoint'а (в сандбоксе `sbx-start.sh` запрашивает URL/модель/ключ интерактивно; дефолт — `host.docker.internal`) |
    | `LLM_MODEL` | `openai/gpt-oss-20b` | Имя модели, обслуживаемой backend'ом |
    | `LLM_API_KEY` | — | Для облачных провайдеров; для локальных LM Studio / Ollama оставьте пустым |
    | `MEMORY_DB_PATH` | `~/.local/share/dev-helper-bot/memory.db` | Файл SQLite с памятью переписки (VM-локальный диск сандбокса; не размещайте в workspace-маунте — сетевая ФС ломает SQLite-локи/WAL) |
@@ -60,33 +60,35 @@ scripts/sbx-setup.sh
 scripts/sbx-start.sh
 ```
 
-Скрипт поднимает остановленный сандбокс (если нужно), останавливает предыдущий процесс бота (если был), запускает бот в фоне с `LLM_BASE_URL=http://host.docker.internal:1234/v1`, открывает keepalive-сессию и показывает хвост лога. Токен Telegram, `LLM_MODEL` и `LLM_API_KEY` бот читает из workspace-`.env`.
+Скрипт поднимает остановленный сандбокс (если нужно), **интерактивно запрашивает** `LLM_BASE_URL`, `LLM_MODEL` и `LLM_API_KEY`, останавливает предыдущий процесс бота (если был), запускает бот в фоне с выбранными значениями через `-e`, открывает keepalive-сессию и показывает хвост лога. Токен Telegram по-прежнему из workspace-`.env`. Скрипт `.env` **не** переписывает — LLM-параметры действуют только на этот процесс.
 
-**Override `LLM_BASE_URL` при запуске в сандбоксе.** Скрипт всегда передаёт `LLM_BASE_URL` в процесс бота явным `-e`, и это значение побеждает `localhost` из `.env` (dotenv не перезаписывает уже заданное окружение). Модель и ключ меняйте в `.env`; адрес endpoint'а — переменной при вызове скрипта.
+Дефолты в промптах (Enter принимает): LM Studio `http://host.docker.internal:1234/v1`, модель `openai/gpt-oss-20b`, пустой API-ключ. Значения из `.env` в промпты не подставляются; если переменная уже экспортирована в shell до вызова скрипта — она показывается как pre-fill в `[…]`.
 
-Локальный LM Studio (порт по умолчанию 1234):
+Локальный LM Studio (Enter×3):
 
 ```bash
 scripts/sbx-start.sh
+# LLM_BASE_URL [http://host.docker.internal:1234/v1]: ⏎
+# LLM_MODEL [openai/gpt-oss-20b]: ⏎
+# LLM_API_KEY [empty]: ⏎
 ```
 
-Другой порт на хосте (например Ollama):
+Другой порт на хосте (например Ollama) — через `LLM_PORT` в дефолтном URL:
 
 ```bash
 LLM_PORT=11434 scripts/sbx-start.sh
+# затем Enter×3 (или поправить URL/модель вручную)
 ```
 
-Облачный OpenAI-совместимый endpoint (модель и ключ — в `.env`):
+Облачный endpoint — ввести URL, модель и ключ с клавиатуры (ключ скрыт при вводе):
 
-```bash
-# в .env:
-#   LLM_MODEL=openai/gpt-5.6-luna
-#   LLM_API_KEY=sk-...
-
-LLM_BASE_URL=https://routerai.ru/api/v1 scripts/sbx-start.sh
+```text
+LLM_BASE_URL [http://host.docker.internal:1234/v1]: https://routerai.ru/api/v1
+LLM_MODEL [openai/gpt-oss-20b]: openai/gpt-5.6-luna@provider=openai/flex&allow_fallbacks=false
+LLM_API_KEY [empty]: <ваш ключ>
 ```
 
-После правок `.env` или override'ов нужен повторный `scripts/sbx-start.sh` (рестарт процесса бота).
+Альтернатива: заранее экспортировать `LLM_*` в shell и нажать Enter×3 (pre-fill). После смены параметров нужен повторный `scripts/sbx-start.sh`.
 
 ### routerai: пин на дешёвый тир `openai/flex`
 
@@ -163,7 +165,7 @@ scripts/sbx-setup.sh        # создать заново с чистого ли
 └────────────────────────────────────────────────────────────┘
 ```
 
-- Связь с LLM: бот внутри VM обращается к `host.docker.internal:1234`; адрес передаётся явным `-e LLM_BASE_URL=…` при запуске и побеждает `localhost` из workspace-`.env` (dotenv не перезаписывает существующее окружение).
+- Связь с LLM: при старте `sbx-start.sh` запрашивает URL/модель/ключ (дефолт — LM Studio на `host.docker.internal:1234`); все три `LLM_*` уходят явными `-e` и побеждают значения из workspace-`.env` (dotenv не перезаписывает существующее окружение).
 - Исходящий интернет (Telegram long-polling, скиллы wttr.in/Habr, PyPI) идёт через штатный egress-прокси сандбокса.
 
 ## Агентный режим
