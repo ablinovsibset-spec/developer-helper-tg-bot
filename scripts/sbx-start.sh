@@ -7,9 +7,9 @@
 #      (дефолты — LM Studio + openai/gpt-oss-20b + пустой ключ; Enter принимает);
 #   3. останавливает предыдущий процесс бота, если он жив (сценарий
 #      обновления кода: правки на хосте + повторный запуск этого скрипта);
-#   4. запускает бот в фоне с явным override всех трёх LLM_* (побеждают
-#      значения из workspace-.env: dotenv не перезаписывает существующее
-#      окружение), логи — в /tmp/bot.log внутри VM;
+#   4. запускает бот в фоне с явным override LLM_* (URL/model через
+#      `-e KEY=value`, ключ — name-only `-e LLM_API_KEY` без значения в argv;
+#      побеждают значения из workspace-.env), логи — в /tmp/bot.log внутри VM;
 #   5. открывает keepalive-сессию: демон Docker Sandboxes останавливает
 #      сандбокс через ~30с после отключения последней exec-сессии, а фоновый
 #      процесс бота сессией не считается — без удержания бот умирает;
@@ -90,15 +90,18 @@ sbx exec "${SANDBOX_NAME}" bash -c "echo \"=== bot start \$(date '+%Y-%m-%d %H:%
 say "Запускаю бот в фоне (логи: /tmp/bot.log внутри VM)"
 # Отделяемся классически (setsid + перенаправление всех потоков внутри VM):
 # процесс переживает закрытие exec-сессии и хостового клиента.
-# Все три LLM_* явно в -e, включая пустой ключ — иначе облачный ключ из
-# workspace-.env «протечёт» в локальный LM Studio-сеанс после Enter×3.
+# URL/model/OBS — через -e KEY=value; ключ — name-only `-e LLM_API_KEY`
+# (значение из экспортированного env хоста, не в argv `sbx`), иначе ключ
+# светится в process list. Пустой ключ тоже передаём явно — иначе облачный
+# ключ из workspace-.env «протечёт» в локальный LM Studio-сеанс после Enter×3.
 # OBS_WEB_HOST=0.0.0.0: дашборд биндится на все интерфейсы VM, чтобы проброс
 # sbx ports (вход через сетевой интерфейс VM) доставал до него; на хост
 # публикуется только loopback (см. config.py / design D6).
+export LLM_API_KEY
 sbx exec \
     -e "LLM_BASE_URL=${LLM_BASE_URL}" \
     -e "LLM_MODEL=${LLM_MODEL}" \
-    -e "LLM_API_KEY=${LLM_API_KEY}" \
+    -e LLM_API_KEY \
     -e "OBS_WEB_HOST=0.0.0.0" \
     "${SANDBOX_NAME}" \
     bash -c "cd '${WORKSPACE}' && setsid nohup \$HOME/.venv-devbot/bin/python -m dev_helper_bot.main >> /tmp/bot.log 2>&1 < /dev/null & echo 'бот запущен (pid '\$!')'" \
