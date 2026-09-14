@@ -19,8 +19,10 @@ from dev_helper_bot.tools import (
     GET_SKILL_TOOL_NAME,
     LIST_TOOL_NAME,
     READ_FILE_TOOL_NAME,
+    SEARCH_DOCUMENTS_TOOL_NAME,
     SEARCH_TOOL_NAME,
     CommandExecutor,
+    DocumentSearcher,
     HistorySearcher,
     exec_command,
     get_skill,
@@ -176,6 +178,7 @@ async def execute_tool_call(
     executor: CommandExecutor,
     history_search: HistorySearcher | None = None,
     skills: Mapping[str, Skill] | None = None,
+    document_search: DocumentSearcher | None = None,
 ) -> tuple[str, bool]:
     """Исполняет валидированный вызов инструмента; ошибки — текстом.
 
@@ -191,7 +194,22 @@ async def execute_tool_call(
     `history_search` — шов доступа к прошлым беседам (search_history,
     list_sessions), привязанный к текущему чату; исполнитель команд —
     только для exec. `skills` — in-memory каталог для get_skill.
+    `document_search` — шов поиска по документам отправителя
+    (search_documents); его отсутствие делает инструмент недоступным,
+    а не ломает прогон.
     """
+    if call["name"] == SEARCH_DOCUMENTS_TOOL_NAME:
+        if document_search is None:
+            return (
+                f"Ошибка: инструмент {SEARCH_DOCUMENTS_TOOL_NAME!r} "
+                "сейчас недоступен.",
+                False,
+            )
+        arguments = json.loads(call["arguments"] or "{}")
+        try:
+            return await document_search.search(arguments["query"]), True
+        except Exception as exc:
+            return f"Ошибка выполнения инструмента: {exc}", False
     if call["name"] == GET_SKILL_TOOL_NAME:
         arguments = json.loads(call["arguments"] or "{}")
         catalog = skills if skills is not None else {}
@@ -234,8 +252,8 @@ async def execute_tool_call(
         return (
             f"Ошибка: неизвестный инструмент {call['name']!r}. "
             f"Доступны {EXEC_TOOL_NAME!r}, {READ_FILE_TOOL_NAME!r}, "
-            f"{GET_SKILL_TOOL_NAME!r}, {SEARCH_TOOL_NAME!r} и "
-            f"{LIST_TOOL_NAME!r}.",
+            f"{GET_SKILL_TOOL_NAME!r}, {SEARCH_TOOL_NAME!r}, "
+            f"{LIST_TOOL_NAME!r} и {SEARCH_DOCUMENTS_TOOL_NAME!r}.",
             False,
         )
     arguments = json.loads(call["arguments"] or "{}")
@@ -254,6 +272,7 @@ async def run_agent(
     executor: CommandExecutor,
     history_search: HistorySearcher | None = None,
     skills: Mapping[str, Skill] | None = None,
+    document_search: DocumentSearcher | None = None,
     recorder: RunRecorder | None = None,
 ) -> str:
     """Агентный цикл: LLM → валидация хода → tool_calls → результаты в историю → повтор.
@@ -349,7 +368,7 @@ async def run_agent(
             else:
                 tool_started = time.perf_counter()
                 result, succeeded = await execute_tool_call(
-                    call, executor, history_search, skills
+                    call, executor, history_search, skills, document_search
                 )
                 duration_ms = (time.perf_counter() - tool_started) * 1000
                 if succeeded:

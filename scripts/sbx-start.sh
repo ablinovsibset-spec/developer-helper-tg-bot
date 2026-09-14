@@ -3,13 +3,19 @@
 #
 # Что делает:
 #   1. поднимает остановленный сандбокс (sbx exec сам стартует его — спайк 1.2);
-#   2. интерактивно запрашивает LLM_BASE_URL / LLM_MODEL / LLM_API_KEY
-#      (дефолты — LM Studio + openai/gpt-oss-20b + пустой ключ; Enter принимает);
+#   2. интерактивно запрашивает четыре параметра: LLM_BASE_URL, LLM_MODEL,
+#      EMBEDDING_MODEL, LLM_API_KEY. Дефолты URL/моделей — облачный стек
+#      (routerai + openai/gpt-5.6-luna + baai/bge-m3); дефолт ключа —
+#      строка LLM_API_KEY= из workspace-.env (файл не source'ится). Enter
+#      принимает дефолт; ввод "-" на ключе даёт пустой ключ;
 #   3. останавливает предыдущий процесс бота, если он жив (сценарий
 #      обновления кода: правки на хосте + повторный запуск этого скрипта);
-#   4. запускает бот в фоне с явным override LLM_* (URL/model через
-#      `-e KEY=value`, ключ — name-only `-e LLM_API_KEY` без значения в argv;
-#      побеждают значения из workspace-.env), логи — в /tmp/bot.log внутри VM;
+#   4. запускает бот в фоне с явным override LLM_* и EMBEDDING_MODEL
+#      (URL/model через `-e KEY=value`, ключ — name-only `-e LLM_API_KEY`
+#      без значения в argv; побеждают значения из workspace-.env).
+#      EMBEDDING_BASE_URL / EMBEDDING_API_KEY скрипт не передаёт — они
+#      остаются за .env (отдельный поставщик эмбеддингов). Логи — в
+#      /tmp/bot.log внутри VM;
 #   5. открывает keepalive-сессию: демон Docker Sandboxes останавливает
 #      сандбокс через ~30с после отключения последней exec-сессии, а фоновый
 #      процесс бота сессией не считается — без удержания бот умирает;
@@ -17,22 +23,39 @@
 #
 # Токен Telegram приходит из workspace-.env через load_dotenv() внутри VM;
 # командам агента .env недоступен (граница доверия — контейнер-жилец).
-# Скрипт .env не переписывает — выбранные LLM_* действуют только на этот запуск.
+# Скрипт .env не переписывает — выбранные LLM_* / EMBEDDING_MODEL действуют
+# только на этот запуск.
 #
 # Остановка/пауза: scripts/sbx-stop.sh. После ребута хоста — запустить
 # этот скрипт заново (автозапуска нет, восстановление ручное).
 set -euo pipefail
 
 SANDBOX_NAME="${SBX_NAME:-devbot}"
-LLM_PORT="${LLM_PORT:-1234}"
 OBS_WEB_PORT="${OBS_WEB_PORT:-8765}"
 WORKSPACE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 KEEPALIVE_PID_FILE="/tmp/dev-helper-bot-keepalive-${SANDBOX_NAME}.pid"
 
-# Pre-fill: уже экспортированные LLM_* из вызывающего shell; иначе — LM Studio.
-DEFAULT_LLM_BASE_URL="${LLM_BASE_URL:-http://host.docker.internal:${LLM_PORT}/v1}"
-DEFAULT_LLM_MODEL="${LLM_MODEL:-openai/gpt-oss-20b}"
-DEFAULT_LLM_API_KEY="${LLM_API_KEY:-}"
+# URL и модели: экспортированное окружение вызывающего shell, иначе константа.
+DEFAULT_LLM_BASE_URL="${LLM_BASE_URL:-https://routerai.ru/api/v1}"
+DEFAULT_LLM_MODEL="${LLM_MODEL:-openai/gpt-5.6-luna}"
+DEFAULT_EMBEDDING_MODEL="${EMBEDDING_MODEL:-baai/bge-m3}"
+
+# Ключ: экспортированное окружение → строка LLM_API_KEY= из .env → пусто.
+# Файл не source'ится: иначе в shell попали бы TELEGRAM_BOT_TOKEN и любой код.
+_dotenv_llm_api_key=""
+if [ -f "${WORKSPACE}/.env" ]; then
+    _dotenv_llm_api_key="$(sed -n 's/^[[:space:]]*LLM_API_KEY=//p' "${WORKSPACE}/.env" | tail -n 1)"
+    _dotenv_llm_api_key="${_dotenv_llm_api_key%$'\r'}"
+    case "${_dotenv_llm_api_key}" in
+        \"*\") _dotenv_llm_api_key="${_dotenv_llm_api_key#\"}"; _dotenv_llm_api_key="${_dotenv_llm_api_key%\"}" ;;
+        \'*\') _dotenv_llm_api_key="${_dotenv_llm_api_key#\'}"; _dotenv_llm_api_key="${_dotenv_llm_api_key%\'}" ;;
+    esac
+fi
+if [ -n "${LLM_API_KEY+x}" ]; then
+    DEFAULT_LLM_API_KEY="${LLM_API_KEY}"
+else
+    DEFAULT_LLM_API_KEY="${_dotenv_llm_api_key}"
+fi
 
 say() { printf '\033[1;34m==>\033[0m %s\n' "$*"; }
 die() { printf '\033[1;31mОшибка:\033[0m %s\n' "$*" >&2; exit 1; }
@@ -63,21 +86,29 @@ printf 'LLM_MODEL [%s]: ' "${DEFAULT_LLM_MODEL}"
 read -r LLM_MODEL_INPUT
 LLM_MODEL="${LLM_MODEL_INPUT:-${DEFAULT_LLM_MODEL}}"
 
+printf 'EMBEDDING_MODEL [%s]: ' "${DEFAULT_EMBEDDING_MODEL}"
+read -r EMBEDDING_MODEL_INPUT
+EMBEDDING_MODEL="${EMBEDDING_MODEL_INPUT:-${DEFAULT_EMBEDDING_MODEL}}"
+
 if [ -n "${DEFAULT_LLM_API_KEY}" ]; then
-    printf 'LLM_API_KEY [set — Enter сохранить, или введите новый]: '
+    printf 'LLM_API_KEY [set — Enter сохранить, - очистить, или введите новый]: '
 else
-    printf 'LLM_API_KEY [empty]: '
+    printf 'LLM_API_KEY [empty — Enter оставить пустым, - очистить, или введите ключ]: '
 fi
 read -rs LLM_API_KEY_INPUT
 printf '\n'
-LLM_API_KEY="${LLM_API_KEY_INPUT:-${DEFAULT_LLM_API_KEY}}"
+if [ "${LLM_API_KEY_INPUT}" = "-" ]; then
+    LLM_API_KEY=""
+else
+    LLM_API_KEY="${LLM_API_KEY_INPUT:-${DEFAULT_LLM_API_KEY}}"
+fi
 
 if [ -n "${LLM_API_KEY}" ]; then
     LLM_API_KEY_STATUS=set
 else
     LLM_API_KEY_STATUS=empty
 fi
-say "LLM: URL=${LLM_BASE_URL} model=${LLM_MODEL} key=${LLM_API_KEY_STATUS}"
+say "LLM: URL=${LLM_BASE_URL} model=${LLM_MODEL} embedding=${EMBEDDING_MODEL} key=${LLM_API_KEY_STATUS}"
 
 say "Останавливаю предыдущий процесс бота (если был)"
 # Паттерн ловит обе формы запуска: модульную (dev_helper_bot.main) и
@@ -92,8 +123,10 @@ say "Запускаю бот в фоне (логи: /tmp/bot.log внутри VM
 # процесс переживает закрытие exec-сессии и хостового клиента.
 # URL/model/OBS — через -e KEY=value; ключ — name-only `-e LLM_API_KEY`
 # (значение из экспортированного env хоста, не в argv `sbx`), иначе ключ
-# светится в process list. Пустой ключ тоже передаём явно — иначе облачный
-# ключ из workspace-.env «протечёт» в локальный LM Studio-сеанс после Enter×3.
+# светится в process list. Пустой ключ тоже передаём явно — ввод "-" на
+# промпте не должен дать .env «протечь» ключ в этот сеанс.
+# EMBEDDING_MODEL уходит через -e, чтобы выбор оператора победил .env;
+# EMBEDDING_BASE_URL / EMBEDDING_API_KEY не передаём (design D5).
 # OBS_WEB_HOST=0.0.0.0: дашборд биндится на все интерфейсы VM, чтобы проброс
 # sbx ports (вход через сетевой интерфейс VM) доставал до него; на хост
 # публикуется только loopback (см. config.py / design D6).
@@ -101,6 +134,7 @@ export LLM_API_KEY
 sbx exec \
     -e "LLM_BASE_URL=${LLM_BASE_URL}" \
     -e "LLM_MODEL=${LLM_MODEL}" \
+    -e "EMBEDDING_MODEL=${EMBEDDING_MODEL}" \
     -e LLM_API_KEY \
     -e "OBS_WEB_HOST=0.0.0.0" \
     "${SANDBOX_NAME}" \

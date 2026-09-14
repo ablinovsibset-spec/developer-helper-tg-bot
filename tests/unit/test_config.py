@@ -4,11 +4,20 @@ import pytest
 
 from dev_helper_bot.config import (
     DEFAULT_BASE_URL,
+    DEFAULT_EMBEDDING_DIM,
+    DEFAULT_EMBEDDING_MODEL,
     DEFAULT_MEMORY_DB_PATH,
     DEFAULT_MODEL,
     DEFAULT_OBS_DB_PATH,
     DEFAULT_OBS_PRICE_INPUT_PER_M,
     DEFAULT_OBS_PRICE_OUTPUT_PER_M,
+    DEFAULT_RAG_DB_PATH,
+    DEFAULT_RAG_MAX_CHUNKS_PER_DOC,
+    DEFAULT_RAG_MAX_EXTRACT_CHARS,
+    DEFAULT_RAG_MAX_UPLOAD_BYTES,
+    embedding_dim,
+    embedding_model_name,
+    make_embeddings,
     make_llm,
     llm_model_name,
     memory_db_path,
@@ -16,8 +25,13 @@ from dev_helper_bot.config import (
     obs_label,
     obs_price_input_per_m,
     obs_price_output_per_m,
+    rag_db_path,
+    rag_max_chunks_per_doc,
+    rag_max_extract_chars,
+    rag_max_upload_bytes,
     telegram_token,
 )
+from dev_helper_bot.embeddings.openai_compat import OpenAICompatibleEmbeddingClient
 from dev_helper_bot.llm.openai_compat import OpenAICompatibleClient
 
 LLM_ENV_VARS = ("LLM_PROVIDER", "LLM_BASE_URL", "LLM_MODEL", "LLM_API_KEY")
@@ -27,6 +41,16 @@ OBS_ENV_VARS = (
     "OBS_PRICE_OUTPUT_PER_M",
     "OBS_LABEL",
 )
+RAG_ENV_VARS = (
+    "RAG_DB_PATH",
+    "EMBEDDING_MODEL",
+    "EMBEDDING_DIM",
+    "EMBEDDING_BASE_URL",
+    "EMBEDDING_API_KEY",
+    "RAG_MAX_UPLOAD_BYTES",
+    "RAG_MAX_EXTRACT_CHARS",
+    "RAG_MAX_CHUNKS_PER_DOC",
+)
 
 
 @pytest.fixture(autouse=True)
@@ -35,9 +59,11 @@ def clean_llm_env(monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.delenv(var, raising=False)
     for var in OBS_ENV_VARS:
         monkeypatch.delenv(var, raising=False)
+    for var in RAG_ENV_VARS:
+        monkeypatch.delenv(var, raising=False)
 
 
-def test_make_llm_defaults_to_local_openai_compatible():
+def test_make_llm_defaults_to_openai_compatible():
     client = make_llm()
 
     assert isinstance(client, OpenAICompatibleClient)
@@ -47,9 +73,9 @@ def test_make_llm_defaults_to_local_openai_compatible():
     assert client._timeout == 120.0
 
 
-def test_llm_defaults_pin_gpt_oss_and_local_lm_studio():
-    assert DEFAULT_BASE_URL == "http://localhost:1234/v1"
-    assert DEFAULT_MODEL == "openai/gpt-oss-20b"
+def test_llm_defaults_pin_routerai_and_gpt_56_luna():
+    assert DEFAULT_BASE_URL == "https://routerai.ru/api/v1"
+    assert DEFAULT_MODEL == "openai/gpt-5.6-luna"
 
 
 def test_make_llm_unknown_provider_raises_value_error(monkeypatch: pytest.MonkeyPatch):
@@ -109,8 +135,8 @@ def test_obs_db_path_env_override_wins(monkeypatch: pytest.MonkeyPatch):
     assert obs_db_path() == "/tmp/custom-obs.db"
 
 
-def test_obs_price_defaults_document_gpt_oss_20b():
-    """Дефолтный прайс — цены запуска gpt-oss-20b в API OpenAI (design D5)."""
+def test_obs_price_defaults_are_accounting_values():
+    """Учётная величина, не прайс текущей дефолтной модели (design D6)."""
     assert DEFAULT_OBS_PRICE_INPUT_PER_M == 0.11
     assert DEFAULT_OBS_PRICE_OUTPUT_PER_M == 0.60
     assert obs_price_input_per_m() == 0.11
@@ -130,3 +156,120 @@ def test_obs_label_defaults_to_none_and_follows_env(monkeypatch: pytest.MonkeyPa
     monkeypatch.setenv("OBS_LABEL", "before-optimization")
 
     assert obs_label() == "before-optimization"
+
+
+# --- RAG: индекс документов и эмбеддинги (change add-document-rag) ---
+
+
+def test_rag_db_path_defaults_to_vm_local_disk_and_not_memory_db():
+    assert rag_db_path() == DEFAULT_RAG_DB_PATH
+    # VM-локальный диск, не workspace-маунт (design D1)
+    assert DEFAULT_RAG_DB_PATH.startswith("~/")
+    assert not DEFAULT_RAG_DB_PATH.startswith(("/", "."))
+    # Отдельный файл от переписки: разный lifecycle
+    assert DEFAULT_RAG_DB_PATH != DEFAULT_MEMORY_DB_PATH
+
+
+def test_rag_db_path_env_override_wins(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("RAG_DB_PATH", "/tmp/custom-rag.db")
+
+    assert rag_db_path() == "/tmp/custom-rag.db"
+
+
+def test_embedding_model_defaults_to_bge_m3_with_matching_dimension():
+    assert DEFAULT_EMBEDDING_MODEL == "baai/bge-m3"
+    assert DEFAULT_EMBEDDING_DIM == 1024
+    assert embedding_model_name() == DEFAULT_EMBEDDING_MODEL
+    assert embedding_dim() == DEFAULT_EMBEDDING_DIM
+
+
+def test_embedding_model_is_configured_apart_from_chat_model(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Смена LLM_MODEL не трогает модель эмбеддингов и наоборот (design D5)."""
+    monkeypatch.setenv("LLM_MODEL", "openai/gpt-5.6-luna")
+    monkeypatch.setenv("EMBEDDING_MODEL", "text-embedding-3-small")
+    monkeypatch.setenv("EMBEDDING_DIM", "1536")
+
+    assert llm_model_name() == "openai/gpt-5.6-luna"
+    assert embedding_model_name() == "text-embedding-3-small"
+    assert embedding_dim() == 1536
+
+
+def test_unset_embedding_model_does_not_inherit_chat_model(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """При незаданном EMBEDDING_MODEL клиент берёт baai/bge-m3, не chat-модель."""
+    monkeypatch.setenv("LLM_MODEL", "openai/gpt-5.6-luna")
+
+    client = make_embeddings()
+
+    assert llm_model_name() == "openai/gpt-5.6-luna"
+    assert client._model == "baai/bge-m3"
+    assert embedding_model_name() == DEFAULT_EMBEDDING_MODEL
+
+
+def test_make_embeddings_reuses_llm_endpoint_and_key_by_default(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setenv("LLM_BASE_URL", "https://routerai.ru/api/v1")
+    monkeypatch.setenv("LLM_API_KEY", "sk-shared")
+
+    client = make_embeddings()
+
+    assert isinstance(client, OpenAICompatibleEmbeddingClient)
+    assert client._base_url == "https://routerai.ru/api/v1"
+    assert client._api_key == "sk-shared"
+    assert client._model == DEFAULT_EMBEDDING_MODEL
+    assert client.dimension == DEFAULT_EMBEDDING_DIM
+
+
+def test_make_embeddings_defaults_to_chat_endpoint():
+    client = make_embeddings()
+
+    assert client._base_url == DEFAULT_BASE_URL
+    assert client._api_key is None
+
+
+def test_embeddings_inherit_chat_endpoint_and_key_when_embedding_overrides_unset(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """EMBEDDING_BASE_URL / EMBEDDING_API_KEY не заданы — берём chat URL и ключ."""
+    monkeypatch.setenv("LLM_BASE_URL", "https://chat.example/v1")
+    monkeypatch.setenv("LLM_API_KEY", "sk-chat")
+
+    client = make_embeddings()
+
+    assert client._base_url == "https://chat.example/v1"
+    assert client._api_key == "sk-chat"
+
+
+def test_make_embeddings_separate_provider_overrides_win(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Эмбеддинги можно увести к другому поставщику, чем чат."""
+    monkeypatch.setenv("LLM_BASE_URL", "https://routerai.ru/api/v1")
+    monkeypatch.setenv("LLM_API_KEY", "sk-chat")
+    monkeypatch.setenv("EMBEDDING_BASE_URL", "http://localhost:8080/v1")
+    monkeypatch.setenv("EMBEDDING_API_KEY", "sk-embed")
+
+    client = make_embeddings()
+
+    assert client._base_url == "http://localhost:8080/v1"
+    assert client._api_key == "sk-embed"
+
+
+def test_rag_limits_defaults_match_design():
+    assert rag_max_upload_bytes() == DEFAULT_RAG_MAX_UPLOAD_BYTES == 5_000_000
+    assert rag_max_extract_chars() == DEFAULT_RAG_MAX_EXTRACT_CHARS == 300_000
+    assert rag_max_chunks_per_doc() == DEFAULT_RAG_MAX_CHUNKS_PER_DOC == 800
+
+
+def test_rag_limits_env_overrides_win(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("RAG_MAX_UPLOAD_BYTES", "1024")
+    monkeypatch.setenv("RAG_MAX_EXTRACT_CHARS", "2048")
+    monkeypatch.setenv("RAG_MAX_CHUNKS_PER_DOC", "7")
+
+    assert rag_max_upload_bytes() == 1024
+    assert rag_max_extract_chars() == 2048
+    assert rag_max_chunks_per_doc() == 7

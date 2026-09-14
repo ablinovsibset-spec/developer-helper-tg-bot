@@ -21,16 +21,18 @@ There is no lint / typecheck / format tooling in this repo — do not invent a p
 
 ## Gotchas
 
-- Keep `MEMORY_DB_PATH` and `OBS_DB_PATH` on **VM-local disk** (defaults under `~/.local/share/…`). Do not put SQLite files on the workspace mount — locks/WAL break.
+- Keep `MEMORY_DB_PATH`, `OBS_DB_PATH` and `RAG_DB_PATH` on **VM-local disk** (defaults under `~/.local/share/…`). Do not put SQLite files on the workspace mount — locks/WAL break.
+- `document_store` opens `rag.db` through **`sqlean.py`**, not stdlib `sqlite3`: many CPython builds ship without loadable-extension support, so `sqlite3` cannot load sqlite-vec. Keep `memory`/`telemetry` on stdlib `sqlite3`.
+- Changing `EMBEDDING_MODEL` / `EMBEDDING_DIM` invalidates `rag.db`; the store fails fast on dimension mismatch and the file must be deleted.
 - Workspace `.env` (Telegram token) is a **trust boundary**: available to the bot process, not mounted into the exec resident container.
-- `scripts/sbx-start.sh` sets `LLM_BASE_URL` (and `OBS_WEB_HOST=0.0.0.0`) via env; that wins over `.env` `localhost` (dotenv does not overwrite existing env).
+- `scripts/sbx-start.sh` interactively asks four parameters (`LLM_BASE_URL`, `LLM_MODEL`, `EMBEDDING_MODEL`, `LLM_API_KEY`) and passes them (plus `OBS_WEB_HOST=0.0.0.0`) via env; that wins over `.env` (dotenv does not overwrite existing env). Key default is the `LLM_API_KEY=` line from `.env` (file is not sourced); typing `-` at the key prompt starts with an empty key.
 - Use an **editable** install (`pip install -e .`). `skills/` and `Dockerfile` resolve via `Path(__file__).parents[2]`.
 - If the observability web port is busy, the bot fails fast and does not start polling.
 - Sandbox keepalive: without the keepalive session from `sbx-start.sh`, the sbx VM stops ~30s after the last exec session.
 
 ## Modules
 
-`main`, `agent`, `tools`, `sandbox`, `memory`, `telemetry`, `obs_web` / `obs_web_pages`, `skills`, `config`, `llm` — see [docs/architecture.md](docs/architecture.md).
+`main`, `agent`, `tools`, `sandbox`, `memory`, `documents`, `document_store`, `embeddings`, `telemetry`, `obs_web` / `obs_web_pages`, `skills`, `config`, `llm` — see [docs/architecture.md](docs/architecture.md).
 
 ## OpenSpec
 

@@ -28,6 +28,18 @@ MEMORY_ENV_LINE = (
     "не проверив эти инструменты."
 )
 
+DOCUMENTS_ENV_LINE = (
+    "Документы пользователя: загруженные файлы (.txt, .md, .docx, .pdf) "
+    "проиндексированы и доступны инструментом search_documents. При любом "
+    "вопросе о содержании документов, политик, инструкций и приложенных "
+    "файлов сначала вызови search_documents. В ответе указывай источник "
+    "строкой «Источник: <имя файла>»; если в результате поиска есть страница "
+    "PDF — добавь её («Источник: file.pdf, стр. 17»). Follow-up с местоимением "
+    "формулируй самодостаточным query (подставь, на что ссылается «их/это»). "
+    "Если поиск не дал фрагментов — скажи, что в загруженных документах "
+    "этого нет, и не выдавай общие знания за содержимое документа."
+)
+
 SKILLS_CATALOG_INTRO = (
     "Скиллы: ниже каталог (name — description). Если description подходит "
     "к запросу — вызови get_skill(name) и следуй телу. Не выдумывай шаги "
@@ -193,7 +205,10 @@ def build_system_prompt(skills: dict[str, Skill]) -> str:
     Тела скиллов не включаются — модель загружает их через get_skill.
     Без даты/времени: системный промпт байтово стабилен между сообщениями.
     """
-    sections = [f"{REASONING_EFFORT_LINE}\n{SANDBOX_ENV_LINE}\n{MEMORY_ENV_LINE}"]
+    sections = [
+        f"{REASONING_EFFORT_LINE}\n{SANDBOX_ENV_LINE}\n{MEMORY_ENV_LINE}"
+        f"\n{DOCUMENTS_ENV_LINE}"
+    ]
     if skills:
         lines = [SKILLS_CATALOG_INTRO]
         for name in sorted(skills):

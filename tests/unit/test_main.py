@@ -16,9 +16,16 @@ from dev_helper_bot.main import (
     handle_new,
     handle_text,
     send_chunked,
+    split_message_lines,
 )
 from dev_helper_bot.memory import MemoryStore
-from dev_helper_bot.skills import MEMORY_ENV_LINE, SANDBOX_ENV_LINE, SKILLS_CATALOG_INTRO, Skill
+from dev_helper_bot.skills import (
+    DOCUMENTS_ENV_LINE,
+    MEMORY_ENV_LINE,
+    SANDBOX_ENV_LINE,
+    SKILLS_CATALOG_INTRO,
+    Skill,
+)
 from tests.conftest import (
     FakeCommandExecutor,
     FakeMessage,
@@ -40,6 +47,7 @@ SYSTEM = (
     "Reasoning: medium"
     f"\n{SANDBOX_ENV_LINE}"
     f"\n{MEMORY_ENV_LINE}"
+    f"\n{DOCUMENTS_ENV_LINE}"
     f"\n\n{SKILLS_CATALOG_INTRO}"
     "\n- wttr-in-api: Погода через wttr.in"
 )
@@ -398,6 +406,25 @@ async def test_send_chunked_boundary_lengths_fit_one_message(fake_bot, length):
     assert len(fake_bot.sent) == 1
 
 
+def test_split_message_lines_keeps_short_list_in_one_batch():
+    lines = ["заголовок", "— a.txt (фрагментов: 1)", "— b.md (фрагментов: 2)"]
+
+    assert split_message_lines(lines) == ["\n".join(lines)]
+
+
+def test_split_message_lines_is_line_aligned_and_under_limit():
+    header = "заголовок"
+    item = "— document-name.txt (фрагментов: 12)"
+    lines = [header] + [f"{item} {index}" for index in range(20)]
+
+    batches = split_message_lines(lines, limit=120)
+
+    assert len(batches) > 1
+    assert all(len(batch) <= 120 for batch in batches)
+    assert batches[0].startswith(header)
+    assert "\n".join(batches) == "\n".join(lines)
+
+
 async def test_same_executor_resident_state_survives_messages(fake_bot, store):
     """Один executor на процесс бота: файл, созданный в первом сообщении,
     читается следующим; между сообщениями stop не вызывается."""
@@ -480,6 +507,7 @@ async def test_main_opens_and_closes_memory_store(fake_bot, monkeypatch, tmp_pat
     monkeypatch.setattr(main_module, "SandboxExecutor", lambda: executor)
     monkeypatch.setattr(main_module, "memory_db_path", lambda: str(tmp_path / "m.db"))
     monkeypatch.setattr(main_module, "obs_db_path", lambda: str(tmp_path / "obs.db"))
+    monkeypatch.setattr(main_module, "rag_db_path", lambda: str(tmp_path / "rag.db"))
     monkeypatch.setattr(main_module, "obs_web_port", lambda: 8765)
     # Веб-дашборд — заглушки lifecycle, чтобы не открывать реальный порт в тестах
     monkeypatch.setattr(main_module, "build_app", lambda store, **kw: ("web_app", store))
@@ -563,6 +591,7 @@ async def test_main_busy_web_port_stops_before_polling(fake_bot, monkeypatch, tm
     monkeypatch.setattr(main_module, "SandboxExecutor", lambda: executor)
     monkeypatch.setattr(main_module, "memory_db_path", lambda: str(tmp_path / "m.db"))
     monkeypatch.setattr(main_module, "obs_db_path", lambda: str(tmp_path / "obs.db"))
+    monkeypatch.setattr(main_module, "rag_db_path", lambda: str(tmp_path / "rag.db"))
     monkeypatch.setattr(main_module, "obs_web_port", lambda: 8765)
     monkeypatch.setattr(main_module, "build_app", lambda store, **kw: "web_app")
     monkeypatch.setattr(main_module, "start_app", fake_start_app)

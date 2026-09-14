@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 
 from dev_helper_bot.skills import (
+    DOCUMENTS_ENV_LINE,
     MEMORY_ENV_LINE,
     REASONING_EFFORT_LINE,
     SANDBOX_ENV_LINE,
@@ -163,6 +164,7 @@ def test_build_system_prompt_without_skills_is_reasoning_and_env():
 
     assert prompt == (
         f"{REASONING_EFFORT_LINE}\n{SANDBOX_ENV_LINE}\n{MEMORY_ENV_LINE}"
+        f"\n{DOCUMENTS_ENV_LINE}"
     )
     assert SKILLS_CATALOG_INTRO not in prompt
 
@@ -185,6 +187,19 @@ def test_memory_env_line_goes_right_after_sandbox_env_line():
     prompt = build_system_prompt({})
 
     assert prompt.index(SANDBOX_ENV_LINE) < prompt.index(MEMORY_ENV_LINE)
+
+
+def test_documents_env_line_instructs_search_attribution_and_refusal():
+    """Блок про документы задаёт три правила разом (design D11): звать
+    search_documents, указывать источник, не выдумывать при пустом поиске."""
+    prompt = build_system_prompt({})
+
+    assert prompt.index(MEMORY_ENV_LINE) < prompt.index(DOCUMENTS_ENV_LINE)
+    assert "search_documents" in prompt
+    assert "Источник:" in prompt
+    assert "стр." in prompt
+    assert "самодостаточным query" in prompt
+    assert "не выдавай общие знания" in prompt
 
 
 def test_system_prompt_from_dir_end_to_end(tmp_path):
@@ -214,7 +229,13 @@ def test_repo_skills_load_with_frontmatter():
     from dev_helper_bot.skills import default_skills_dir
 
     skills = load_skills(default_skills_dir())
-    assert {"morning", "wttr-in-api", "habr-feed", "search-history"} <= set(skills)
+    assert {
+        "morning",
+        "wttr-in-api",
+        "habr-feed",
+        "search-history",
+        "document-qa",
+    } <= set(skills)
     prompt = build_system_prompt(skills)
     assert "get_skill" in prompt
     assert "format=j1" not in prompt

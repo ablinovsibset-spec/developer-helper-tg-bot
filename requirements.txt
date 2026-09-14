@@ -5,3 +5,7 @@ aiogram>=3.0,<4.0
 python-dotenv>=1.0
 aiohttp>=3.9
 aiosqlite>=0.20
+sqlite-vec>=0.1.9
+sqlean.py>=3.45
+pypdf>=6.14.2
+python-docx>=1.1

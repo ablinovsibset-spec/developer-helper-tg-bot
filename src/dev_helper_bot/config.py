@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import os
 
+from dev_helper_bot.embeddings import EmbeddingClient
+from dev_helper_bot.embeddings.openai_compat import OpenAICompatibleEmbeddingClient
 from dev_helper_bot.llm import LLMClient, LLMUnavailable
 from dev_helper_bot.llm.openai_compat import OpenAICompatibleClient
 
-DEFAULT_BASE_URL = "http://localhost:1234/v1"
-DEFAULT_MODEL = "openai/gpt-oss-20b"
+DEFAULT_BASE_URL = "https://routerai.ru/api/v1"
+DEFAULT_MODEL = "openai/gpt-5.6-luna"
 DEFAULT_PROVIDER = "openai_compatible"
 
 DEFAULT_MEMORY_DB_PATH = "~/.local/share/dev-helper-bot/memory.db"
@@ -16,12 +18,29 @@ DEFAULT_MEMORY_DB_PATH = "~/.local/share/dev-helper-bot/memory.db"
 DEFAULT_OBS_DB_PATH = "~/.local/share/dev-helper-bot/observability.db"
 """БД телеметрии — та же причина VM-локального диска (design D4)."""
 
+DEFAULT_RAG_DB_PATH = "~/.local/share/dev-helper-bot/rag.db"
+"""Индекс документов — отдельная БД от переписки (design D1 change
+add-document-rag): другой lifecycle и расширение sqlite-vec. Тот же
+VM-локальный диск, что у memory/obs."""
+
+DEFAULT_EMBEDDING_MODEL = "baai/bge-m3"
+DEFAULT_EMBEDDING_DIM = 1024
+"""Модель эмбеддингов и её размерность (design D5). Смена модели меняет
+геометрию векторов: старый индекс несовместим — нужен wipe rag.db
+и повторная загрузка документов."""
+
+DEFAULT_RAG_MAX_UPLOAD_BYTES = 5_000_000
+DEFAULT_RAG_MAX_EXTRACT_CHARS = 300_000
+DEFAULT_RAG_MAX_CHUNKS_PER_DOC = 800
+"""Лимиты индексации (design D8): байты проверяются до тяжёлой работы,
+символы и число chunks — после извлечения и разбиения."""
+
 DEFAULT_OBS_PRICE_INPUT_PER_M = 0.11
 DEFAULT_OBS_PRICE_OUTPUT_PER_M = 0.60
-"""Дефолтный виртуальный прайс $/1M токенов — цены запуска gpt-oss-20b
-в API OpenAI (design D5). Локальная модель реально стоит $0: стоимость
-учётная, для сопоставимости экспериментов «до/после»; переопределяется
-OBS_PRICE_INPUT_PER_M / OBS_PRICE_OUTPUT_PER_M."""
+"""Учётная величина виртуального прайса $/1M токенов (0.11 вход / 0.60 выход)
+для сопоставимости экспериментов «до/после», а не цена текущей дефолтной
+модели (design D6). Переопределяется OBS_PRICE_INPUT_PER_M /
+OBS_PRICE_OUTPUT_PER_M."""
 
 
 def make_llm() -> LLMClient:
@@ -46,6 +65,56 @@ def make_llm() -> LLMClient:
 def llm_model_name() -> str:
     """Имя модели для записи в телеметрию (то же, что уходит поставщику)."""
     return os.getenv("LLM_MODEL", DEFAULT_MODEL)
+
+
+def make_embeddings() -> EmbeddingClient:
+    """Клиент эмбеддингов для RAG (design D5).
+
+    По умолчанию тот же endpoint и ключ, что у chat (`LLM_BASE_URL` /
+    `LLM_API_KEY`), но своя модель `EMBEDDING_MODEL`. Отдельные
+    `EMBEDDING_BASE_URL` / `EMBEDDING_API_KEY` нужны, когда эмбеддинги
+    берутся у другого поставщика, чем диалог.
+    """
+    base_url = os.getenv("EMBEDDING_BASE_URL") or os.getenv(
+        "LLM_BASE_URL", DEFAULT_BASE_URL
+    )
+    api_key = os.getenv("EMBEDDING_API_KEY") or os.getenv("LLM_API_KEY") or None
+    return OpenAICompatibleEmbeddingClient(
+        base_url=base_url,
+        model=embedding_model_name(),
+        dimension=embedding_dim(),
+        api_key=api_key,
+    )
+
+
+def embedding_model_name() -> str:
+    """Модель эмбеддингов; задаётся отдельно от LLM_MODEL (design D5)."""
+    return os.getenv("EMBEDDING_MODEL", DEFAULT_EMBEDDING_MODEL)
+
+
+def embedding_dim() -> int:
+    """Размерность векторов модели эмбеддингов (design D5)."""
+    return int(os.getenv("EMBEDDING_DIM", DEFAULT_EMBEDDING_DIM))
+
+
+def rag_db_path() -> str:
+    """Путь к БД индекса документов; переопределяется RAG_DB_PATH (design D1)."""
+    return os.getenv("RAG_DB_PATH", DEFAULT_RAG_DB_PATH)
+
+
+def rag_max_upload_bytes() -> int:
+    """Лимит сырого размера загружаемого файла, байты (design D8)."""
+    return int(os.getenv("RAG_MAX_UPLOAD_BYTES", DEFAULT_RAG_MAX_UPLOAD_BYTES))
+
+
+def rag_max_extract_chars() -> int:
+    """Лимит объёма извлечённого из документа текста, символы (design D8)."""
+    return int(os.getenv("RAG_MAX_EXTRACT_CHARS", DEFAULT_RAG_MAX_EXTRACT_CHARS))
+
+
+def rag_max_chunks_per_doc() -> int:
+    """Лимит числа chunks одного документа после разбиения (design D8)."""
+    return int(os.getenv("RAG_MAX_CHUNKS_PER_DOC", DEFAULT_RAG_MAX_CHUNKS_PER_DOC))
 
 
 def telegram_token() -> str:
