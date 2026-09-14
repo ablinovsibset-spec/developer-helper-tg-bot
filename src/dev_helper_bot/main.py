@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import html
 import io
 import logging
+from collections.abc import Sequence
 from datetime import datetime
 
 from aiogram import Bot, Dispatcher, F
@@ -118,6 +120,51 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
 )
 log = logging.getLogger("bot")
+
+
+def escape_html(value: object) -> str:
+    """Экранирует пользовательский текст для ParseMode.HTML."""
+    return html.escape(str(value), quote=False)
+
+
+def format_html(template: str, **kwargs: object) -> str:
+    """Подставляет поля в HTML-сообщение: строки экранируются, числа нет."""
+    rendered: dict[str, object] = {}
+    for key, value in kwargs.items():
+        if isinstance(value, int) and not isinstance(value, bool):
+            rendered[key] = value
+        else:
+            rendered[key] = escape_html(value)
+    return template.format(**rendered)
+
+
+def split_message_lines(
+    lines: Sequence[str], limit: int = TELEGRAM_MESSAGE_LIMIT
+) -> list[str]:
+    """Пакует строки в сообщения не длиннее лимита Telegram, по границам строк."""
+    batches: list[str] = []
+    current: list[str] = []
+    size = 0
+    for line in lines:
+        if len(line) > limit:
+            if current:
+                batches.append("\n".join(current))
+                current = []
+                size = 0
+            for i in range(0, len(line), limit):
+                batches.append(line[i : i + limit])
+            continue
+        extra = len(line) + (1 if current else 0)
+        if current and size + extra > limit:
+            batches.append("\n".join(current))
+            current = [line]
+            size = len(line)
+            continue
+        current.append(line)
+        size += extra
+    if current:
+        batches.append("\n".join(current))
+    return batches
 
 
 async def send_chunked(bot: Bot, chat_id: int, text: str) -> None:
@@ -292,7 +339,7 @@ async def handle_document(
     if not is_supported_document(filename):
         await bot.send_message(
             chat_id=chat_id,
-            text=UNSUPPORTED_DOCUMENT_MESSAGE.format(filename=filename),
+            text=format_html(UNSUPPORTED_DOCUMENT_MESSAGE, filename=filename),
         )
         return
     if documents is None or embeddings is None:
@@ -305,12 +352,14 @@ async def handle_document(
     except DocumentError as exc:
         await bot.send_message(
             chat_id=chat_id,
-            text=DOCUMENT_ERROR_TEMPLATE.format(filename=filename, reason=exc),
+            text=format_html(
+                DOCUMENT_ERROR_TEMPLATE, filename=filename, reason=exc
+            ),
         )
         return
 
     sent = await bot.send_message(
-        chat_id=chat_id, text=INDEXING_MESSAGE.format(filename=filename)
+        chat_id=chat_id, text=format_html(INDEXING_MESSAGE, filename=filename)
     )
     status_id = getattr(sent, "message_id", None)
     try:
@@ -321,7 +370,7 @@ async def handle_document(
             bot,
             chat_id,
             status_id,
-            DOWNLOAD_ERROR_MESSAGE.format(filename=filename),
+            format_html(DOWNLOAD_ERROR_MESSAGE, filename=filename),
         )
         return
 
@@ -331,9 +380,11 @@ async def handle_document(
             bot,
             chat_id,
             status_id,
-            INDEXING_EXTRACT_MESSAGE.format(filename=filename),
+            format_html(INDEXING_EXTRACT_MESSAGE, filename=filename),
         )
-        text, page_spans = extract_document(filename, data)
+        text, page_spans = await asyncio.to_thread(
+            extract_document, filename, data
+        )
         chunks = chunks_from_text(
             text,
             page_spans,
@@ -344,14 +395,16 @@ async def handle_document(
             bot,
             chat_id,
             status_id,
-            INDEXING_CHUNKS_MESSAGE.format(filename=filename, count=len(chunks)),
+            format_html(
+                INDEXING_CHUNKS_MESSAGE, filename=filename, count=len(chunks)
+            ),
         )
     except DocumentError as exc:
         await _update_status(
             bot,
             chat_id,
             status_id,
-            DOCUMENT_ERROR_TEMPLATE.format(filename=filename, reason=exc),
+            format_html(DOCUMENT_ERROR_TEMPLATE, filename=filename, reason=exc),
         )
         return
 
@@ -370,7 +423,7 @@ async def handle_document(
             bot,
             chat_id,
             status_id,
-            EMBEDDINGS_ERROR_MESSAGE.format(filename=filename),
+            format_html(EMBEDDINGS_ERROR_MESSAGE, filename=filename),
         )
         return
 
@@ -381,7 +434,7 @@ async def handle_document(
         bot,
         chat_id,
         status_id,
-        INDEXED_MESSAGE.format(filename=filename, count=count),
+        format_html(INDEXED_MESSAGE, filename=filename, count=count),
     )
 
 
@@ -405,8 +458,11 @@ async def _embed_chunks(
             bot,
             chat_id,
             status_id,
-            INDEXING_EMBED_MESSAGE.format(
-                filename=filename, done=len(vectors), total=total
+            format_html(
+                INDEXING_EMBED_MESSAGE,
+                filename=filename,
+                done=len(vectors),
+                total=total,
             ),
         )
     return vectors, status_id
@@ -426,8 +482,11 @@ async def handle_documents(
         return
     lines = [DOCUMENTS_LIST_HEADER]
     for info in infos:
-        lines.append(f"— {info.filename} (фрагментов: {info.chunk_count})")
-    await bot.send_message(chat_id=chat_id, text="\n".join(lines))
+        lines.append(
+            f"— {escape_html(info.filename)} (фрагментов: {info.chunk_count})"
+        )
+    for batch in split_message_lines(lines):
+        await bot.send_message(chat_id=chat_id, text=batch)
 
 
 async def handle_delete(
@@ -444,12 +503,10 @@ async def handle_delete(
         await bot.send_message(chat_id=chat_id, text=DOCUMENTS_DISABLED_MESSAGE)
         return
     deleted = await documents.delete_by_filename(_sender_id(message), filename)
-    text = (
-        DELETE_DONE_TEMPLATE.format(filename=filename)
-        if deleted
-        else DELETE_NOT_FOUND_TEMPLATE.format(filename=filename)
+    template = DELETE_DONE_TEMPLATE if deleted else DELETE_NOT_FOUND_TEMPLATE
+    await bot.send_message(
+        chat_id=chat_id, text=format_html(template, filename=filename)
     )
-    await bot.send_message(chat_id=chat_id, text=text)
 
 
 async def main() -> None:

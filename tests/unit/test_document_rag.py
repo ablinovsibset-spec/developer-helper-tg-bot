@@ -23,7 +23,9 @@ from dev_helper_bot.main import (
     INDEXING_EMBED_MESSAGE,
     INDEXING_EXTRACT_MESSAGE,
     INDEXING_MESSAGE,
+    TELEGRAM_MESSAGE_LIMIT,
     UNSUPPORTED_DOCUMENT_MESSAGE,
+    format_html,
     handle_delete,
     handle_document,
     handle_documents,
@@ -174,6 +176,19 @@ async def test_upload_unsupported_format_is_rejected_without_indexing(
     assert await documents.list_documents(ALICE) == []
 
 
+async def test_upload_escapes_html_filename_in_unsupported_message(
+    fake_bot, documents, embeddings
+):
+    filename = '<a href="http://evil.example">report</a>.zip'
+
+    await handle_document(upload(filename), fake_bot, documents, embeddings)
+
+    text = fake_bot.sent[-1]["text"]
+    assert text == format_html(UNSUPPORTED_DOCUMENT_MESSAGE, filename=filename)
+    assert "<a href" not in text
+    assert "&lt;a href=" in text
+
+
 async def test_upload_empty_document_reports_error_and_leaves_no_index(
     fake_bot, documents, embeddings
 ):
@@ -315,6 +330,27 @@ async def test_documents_command_empty_list_message(fake_bot, documents):
     )
 
     assert fake_bot.sent == [{"chat_id": CHAT_ID, "text": DOCUMENTS_EMPTY_MESSAGE}]
+
+
+async def test_documents_command_splits_long_list_below_telegram_limit(
+    fake_bot, documents, embeddings
+):
+    chunks = ["фрагмент"]
+    vectors = await embeddings.embed(chunks)
+    for index in range(80):
+        name = f"policy-{index:02d}-{'x' * 60}.txt"
+        await documents.index_document(ALICE, name, chunks, vectors)
+
+    await handle_documents(
+        FakeMessage("/documents", chat_id=CHAT_ID, user_id=ALICE), fake_bot, documents
+    )
+
+    texts = [item["text"] for item in fake_bot.sent]
+    assert len(texts) > 1
+    assert all(len(text) <= TELEGRAM_MESSAGE_LIMIT for text in texts)
+    assert texts[0].startswith(DOCUMENTS_LIST_HEADER)
+    joined = "\n".join(texts)
+    assert joined.count(".txt") == 80
 
 
 async def test_documents_command_does_not_show_other_users_files(

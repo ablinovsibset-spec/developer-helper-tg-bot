@@ -5,6 +5,7 @@ import pytest
 from dev_helper_bot.document_store import (
     SEARCH_EMBEDDINGS_ERROR,
     SEARCH_NO_DOCUMENTS_MESSAGE,
+    SEARCH_NOT_FOUND_TEMPLATE,
     ChunkMatch,
     DocumentStore,
     DocumentStoreUnavailable,
@@ -503,6 +504,49 @@ async def test_searcher_uses_conversation_context_for_follow_up(store, embedding
 
     assert "vacation_policy.md" in result
     assert "переносятся" in result
+
+
+async def test_searcher_unrelated_query_with_documents_is_not_found(
+    store, embeddings
+):
+    """Ближайшие соседи по вектору не считаются находкой без релевантности."""
+    await index(store, embeddings, ALICE, "vacation_policy.txt", VACATION_POLICY)
+    searcher = UserDocumentSearcher(store, embeddings, ALICE)
+    query = "квантовая физика Марса"
+
+    result = await searcher.search(query)
+
+    assert result == SEARCH_NOT_FOUND_TEMPLATE.format(query=query)
+    vectors = await embeddings.embed([query])
+    assert await store.retrieve(ALICE, query, vectors[0], k=5) == []
+
+
+async def test_failed_replace_rolls_back_previous_version(store, embeddings):
+    """Сбой вставки после delete не должен закоммитить пустую замену."""
+    await index(store, embeddings, ALICE, "policy.txt", VACATION_POLICY)
+    real_execute = store._conn.execute
+
+    async def boom(sql, parameters=None):
+        if isinstance(sql, str) and sql.startswith("INSERT INTO chunks"):
+            raise RuntimeError("insert failed")
+        if parameters is None:
+            return await real_execute(sql)
+        return await real_execute(sql, parameters)
+
+    store._conn.execute = boom
+    try:
+        with pytest.raises(RuntimeError, match="insert failed"):
+            await index(store, embeddings, ALICE, "policy.txt", EXPENSE_POLICY)
+    finally:
+        store._conn.execute = real_execute
+
+    infos = await store.list_documents(ALICE)
+    assert [info.filename for info in infos] == ["policy.txt"]
+    vectors = await embeddings.embed(["отпуск календарных дней"])
+    matches = await store.search(ALICE, vectors[0], k=5)
+    assert matches
+    assert "28 календарных дней" in matches[0].text
+    assert all("Чеки" not in match.text for match in matches)
 
 
 def test_format_matches_includes_pdf_page_or_range_but_not_for_md():

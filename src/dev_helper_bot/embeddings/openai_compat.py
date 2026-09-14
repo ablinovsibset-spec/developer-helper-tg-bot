@@ -32,7 +32,18 @@ def _parse_vectors(data: dict[str, Any], expected: int) -> list[list[float]]:
         raise EmbeddingsUnavailable(
             f"Embeddings response has {len(items)} vectors for {expected} texts"
         )
-    ordered = sorted(items, key=lambda item: item.get("index", 0))
+    try:
+        indices = [item["index"] for item in items]
+    except (KeyError, TypeError) as exc:
+        raise EmbeddingsUnavailable(
+            "Embeddings response has invalid indices"
+        ) from exc
+    if (
+        any(not isinstance(index, int) or isinstance(index, bool) for index in indices)
+        or set(indices) != set(range(expected))
+    ):
+        raise EmbeddingsUnavailable("Embeddings response has invalid indices")
+    ordered = [item for _, item in sorted(zip(indices, items))]
     vectors = [[float(value) for value in item["embedding"]] for item in ordered]
     if any(not vector for vector in vectors):
         raise EmbeddingsUnavailable("Embeddings response contains an empty vector")

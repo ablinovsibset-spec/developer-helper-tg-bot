@@ -16,6 +16,7 @@ from dev_helper_bot.main import (
     handle_new,
     handle_text,
     send_chunked,
+    split_message_lines,
 )
 from dev_helper_bot.memory import MemoryStore
 from dev_helper_bot.skills import (
@@ -403,6 +404,25 @@ async def test_send_chunked_boundary_lengths_fit_one_message(fake_bot, length):
     await send_chunked(fake_bot, CHAT_ID, text)
 
     assert len(fake_bot.sent) == 1
+
+
+def test_split_message_lines_keeps_short_list_in_one_batch():
+    lines = ["заголовок", "— a.txt (фрагментов: 1)", "— b.md (фрагментов: 2)"]
+
+    assert split_message_lines(lines) == ["\n".join(lines)]
+
+
+def test_split_message_lines_is_line_aligned_and_under_limit():
+    header = "заголовок"
+    item = "— document-name.txt (фрагментов: 12)"
+    lines = [header] + [f"{item} {index}" for index in range(20)]
+
+    batches = split_message_lines(lines, limit=120)
+
+    assert len(batches) > 1
+    assert all(len(batch) <= 120 for batch in batches)
+    assert batches[0].startswith(header)
+    assert "\n".join(batches) == "\n".join(lines)
 
 
 async def test_same_executor_resident_state_survives_messages(fake_bot, store):

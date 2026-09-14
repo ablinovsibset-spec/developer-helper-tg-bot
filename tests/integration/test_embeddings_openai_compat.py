@@ -146,10 +146,27 @@ async def test_malformed_payload_raises_embeddings_unavailable(server):
         await client(server).embed(["текст"])
 
 
-async def test_vector_count_mismatch_raises_embeddings_unavailable(server):
-    server.payload = {"data": [{"index": 0, "embedding": vector(0.0)}]}
+async def test_duplicate_index_raises_embeddings_unavailable(server):
+    server.payload = {
+        "data": [
+            {"index": 0, "embedding": vector(0.0)},
+            {"index": 0, "embedding": vector(1.0)},
+        ]
+    }
 
-    with pytest.raises(EmbeddingsUnavailable, match="1 vectors for 2 texts"):
+    with pytest.raises(EmbeddingsUnavailable, match="invalid indices"):
+        await client(server).embed(["первый", "второй"])
+
+
+async def test_missing_index_raises_embeddings_unavailable(server):
+    server.payload = {
+        "data": [
+            {"embedding": vector(0.0)},
+            {"index": 1, "embedding": vector(1.0)},
+        ]
+    }
+
+    with pytest.raises(EmbeddingsUnavailable, match="invalid indices"):
         await client(server).embed(["первый", "второй"])
 
 

@@ -13,8 +13,10 @@ lifecycle и своё расширение SQLite. Владелец каждог
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -37,6 +39,12 @@ CANDIDATE_K = 15
 
 RRF_K = 60
 """Константа Reciprocal Rank Fusion: вклад канала = 1/(60 + rank)."""
+
+MAX_COSINE_DISTANCE = 0.80
+"""Потолок косинусного расстояния sqlite-vec (1 − cosine similarity).
+Ближе к 0 — тот же смысл, около 1 — ортогональные векторы. Нерелевантный
+запрос всё равно имеет ближайших соседей; без порога SEARCH_NOT_FOUND
+не достигается. FTS-совпадения без вектора проходят по лексическому сигналу."""
 
 SEARCH_SNIPPET_CHARS = 600
 """Потолок одного фрагмента в результате инструмента: Top-K фрагментов
@@ -188,6 +196,37 @@ def lexical_rerank_score(query: str, text: str, rrf: float) -> float:
     return rrf + exact + overlap
 
 
+_CONTENT_TOKEN = re.compile(r"[0-9A-Za-zА-Яа-яЁё_]{4,}", re.UNICODE)
+
+
+def _query_content_tokens(query: str) -> set[str]:
+    """Токены запроса длиной ≥ 4; если их нет — любые слова (коды, «QX»)."""
+    tokens = {token.lower() for token in _CONTENT_TOKEN.findall(query)}
+    if tokens:
+        return tokens
+    return {token.lower() for token in _FTS_TOKEN.findall(query)}
+
+
+def is_relevant_candidate(query: str, match: ChunkMatch) -> bool:
+    """Отсекает ближайших соседей без смыслового пересечения с запросом.
+
+    Векторный канал всегда возвращает K соседей. Кандидат остаётся, если
+    косинусное расстояние ниже порога или в тексте есть содержательный
+    токен / точная строка запроса (FTS-only совпадения без вектора).
+    """
+    if match.distance <= MAX_COSINE_DISTANCE:
+        return True
+    query_l = query.lower().strip()
+    text_l = match.text.lower()
+    if query_l and query_l in text_l:
+        return True
+    q_tokens = _query_content_tokens(query)
+    if not q_tokens:
+        return False
+    t_tokens = {token.lower() for token in _FTS_TOKEN.findall(match.text)}
+    return bool(q_tokens & t_tokens)
+
+
 class DocumentStore:
     """Документы, их chunks и векторы одного файла БД.
 
@@ -199,6 +238,7 @@ class DocumentStore:
         self._path = Path(db_path).expanduser()
         self._dimension = dimension
         self._db: aiosqlite.Connection | None = None
+        self._lock = asyncio.Lock()
 
     @property
     def dimension(self) -> int:
@@ -290,6 +330,33 @@ class DocumentStore:
             raise RuntimeError("DocumentStore не открыт: сначала вызовите open()")
         return self._db
 
+    @asynccontextmanager
+    async def _locked(self):
+        """Сериализует доступ к единственному aiosqlite-соединению."""
+        async with self._lock:
+            yield
+
+    @asynccontextmanager
+    async def _write_txn(self):
+        """Одна запись: commit только после успеха, иначе rollback.
+
+        Иначе удаление старой версии и частичные INSERT могут остаться
+        в открытой транзакции и уехать в индекс вместе с чужим commit.
+        """
+        async with self._lock:
+            try:
+                yield
+                await self._conn.commit()
+            except Exception:
+                try:
+                    await self._conn.rollback()
+                except Exception:
+                    log.warning(
+                        "rollback failed after document store error",
+                        exc_info=True,
+                    )
+                raise
+
     async def index_document(
         self,
         user_id: int,
@@ -316,40 +383,40 @@ class DocumentStore:
             raise ValueError(
                 f"vectors must have dimension {self._dimension}"
             )
-        await self._delete_rows(user_id, filename)
-        cursor = await self._conn.execute(
-            "INSERT INTO documents (user_id, filename, file_type, created_at) "
-            "VALUES (?, ?, ?, ?)",
-            (user_id, filename, Path(filename).suffix.lower(), _utcnow_iso()),
-        )
-        document_id = cursor.lastrowid
-        for index, (chunk, vector) in enumerate(zip(normalized, vectors)):
+        async with self._write_txn():
+            await self._delete_rows(user_id, filename)
             cursor = await self._conn.execute(
-                "INSERT INTO chunks (document_id, chunk_index, text, "
-                "page_start, page_end) VALUES (?, ?, ?, ?, ?)",
-                (
-                    document_id,
-                    index,
-                    chunk.text,
-                    chunk.page_start,
-                    chunk.page_end,
-                ),
+                "INSERT INTO documents (user_id, filename, file_type, created_at) "
+                "VALUES (?, ?, ?, ?)",
+                (user_id, filename, Path(filename).suffix.lower(), _utcnow_iso()),
             )
-            chunk_id = cursor.lastrowid
-            await self._conn.execute(
-                "INSERT INTO chunk_vectors (chunk_id, embedding, user_id) "
-                "VALUES (?, ?, ?)",
-                (
-                    chunk_id,
-                    sqlite_vec.serialize_float32(vector),
-                    user_id,
-                ),
-            )
-            await self._conn.execute(
-                "INSERT INTO chunk_fts(rowid, text) VALUES (?, ?)",
-                (chunk_id, chunk.text),
-            )
-        await self._conn.commit()
+            document_id = cursor.lastrowid
+            for index, (chunk, vector) in enumerate(zip(normalized, vectors)):
+                cursor = await self._conn.execute(
+                    "INSERT INTO chunks (document_id, chunk_index, text, "
+                    "page_start, page_end) VALUES (?, ?, ?, ?, ?)",
+                    (
+                        document_id,
+                        index,
+                        chunk.text,
+                        chunk.page_start,
+                        chunk.page_end,
+                    ),
+                )
+                chunk_id = cursor.lastrowid
+                await self._conn.execute(
+                    "INSERT INTO chunk_vectors (chunk_id, embedding, user_id) "
+                    "VALUES (?, ?, ?)",
+                    (
+                        chunk_id,
+                        sqlite_vec.serialize_float32(vector),
+                        user_id,
+                    ),
+                )
+                await self._conn.execute(
+                    "INSERT INTO chunk_fts(rowid, text) VALUES (?, ?)",
+                    (chunk_id, chunk.text),
+                )
         return len(normalized)
 
     async def _delete_rows(self, user_id: int, filename: str) -> bool:
@@ -386,14 +453,14 @@ class DocumentStore:
 
     async def delete_by_filename(self, user_id: int, filename: str) -> bool:
         """Удаляет документ пользователя по имени; False — такого нет."""
-        deleted = await self._delete_rows(user_id, filename)
-        await self._conn.commit()
-        return deleted
+        async with self._write_txn():
+            return await self._delete_rows(user_id, filename)
 
     async def list_documents(self, user_id: int) -> list[DocumentInfo]:
         """Документы пользователя по алфавиту; чужие не видны."""
-        cursor = await self._conn.execute(_LIST_SQL, (user_id,))
-        rows = await cursor.fetchall()
+        async with self._locked():
+            cursor = await self._conn.execute(_LIST_SQL, (user_id,))
+            rows = await cursor.fetchall()
         return [
             DocumentInfo(filename=filename, created_at=created_at, chunk_count=count)
             for filename, created_at, count in rows
@@ -417,16 +484,17 @@ class DocumentStore:
             raise ValueError(
                 f"query vector must have dimension {self._dimension}"
             )
-        cursor = await self._conn.execute(
-            _SEARCH_SQL,
-            (
-                sqlite_vec.serialize_float32(query_vector),
-                user_id,
-                max(1, k),
-                user_id,
-            ),
-        )
-        rows = await cursor.fetchall()
+        async with self._locked():
+            cursor = await self._conn.execute(
+                _SEARCH_SQL,
+                (
+                    sqlite_vec.serialize_float32(query_vector),
+                    user_id,
+                    max(1, k),
+                    user_id,
+                ),
+            )
+            rows = await cursor.fetchall()
         return [_match_from_vec_row(row) for row in rows]
 
     async def search_text(
@@ -444,10 +512,11 @@ class DocumentStore:
         if not match_query:
             return []
         try:
-            cursor = await self._conn.execute(
-                _FTS_SQL, (match_query, user_id, max(1, k))
-            )
-            rows = await cursor.fetchall()
+            async with self._locked():
+                cursor = await self._conn.execute(
+                    _FTS_SQL, (match_query, user_id, max(1, k))
+                )
+                rows = await cursor.fetchall()
         except Exception:
             log.warning("FTS MATCH failed for query %r", query, exc_info=True)
             return []
@@ -475,7 +544,12 @@ class DocumentStore:
             key=lambda item: lexical_rerank_score(query, item[0].text, item[1]),
             reverse=True,
         )
-        return [match for match, _rrf in ranked[:top_k]]
+        relevant = [
+            (match, rrf)
+            for match, rrf in ranked
+            if is_relevant_candidate(query, match)
+        ]
+        return [match for match, _rrf in relevant[:top_k]]
 
 
 def _match_from_vec_row(row: tuple) -> ChunkMatch:

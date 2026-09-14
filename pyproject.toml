@@ -17,7 +17,7 @@ dependencies = [
     # Драйвер SQLite для rag.db: несёт сборку с включённой загрузкой расширений
     # (stdlib sqlite3 многих сборок CPython её не умеет) — design D10.
     "sqlean.py>=3.45",
-    "pypdf>=5.0",
+    "pypdf>=6.14.2",
     "python-docx>=1.1",
 ]
 

@@ -239,8 +239,13 @@ def test_chunk_text_covers_whole_text():
 
     chunks = chunk_text(text, size=300, overlap=60)
 
+    covered_tokens = {
+        token
+        for chunk in chunks
+        for token in chunk.split()
+    }
     for index in range(500):
-        assert any(f"факт{index}" in chunk for chunk in chunks)
+        assert f"факт{index}" in covered_tokens
 
 
 def test_chunk_text_overlap_not_smaller_than_size_terminates():
