@@ -18,7 +18,13 @@ from dev_helper_bot.main import (
     send_chunked,
 )
 from dev_helper_bot.memory import MemoryStore
-from dev_helper_bot.skills import MEMORY_ENV_LINE, SANDBOX_ENV_LINE, SKILLS_CATALOG_INTRO, Skill
+from dev_helper_bot.skills import (
+    DOCUMENTS_ENV_LINE,
+    MEMORY_ENV_LINE,
+    SANDBOX_ENV_LINE,
+    SKILLS_CATALOG_INTRO,
+    Skill,
+)
 from tests.conftest import (
     FakeCommandExecutor,
     FakeMessage,
@@ -40,6 +46,7 @@ SYSTEM = (
     "Reasoning: medium"
     f"\n{SANDBOX_ENV_LINE}"
     f"\n{MEMORY_ENV_LINE}"
+    f"\n{DOCUMENTS_ENV_LINE}"
     f"\n\n{SKILLS_CATALOG_INTRO}"
     "\n- wttr-in-api: Погода через wttr.in"
 )
@@ -480,6 +487,7 @@ async def test_main_opens_and_closes_memory_store(fake_bot, monkeypatch, tmp_pat
     monkeypatch.setattr(main_module, "SandboxExecutor", lambda: executor)
     monkeypatch.setattr(main_module, "memory_db_path", lambda: str(tmp_path / "m.db"))
     monkeypatch.setattr(main_module, "obs_db_path", lambda: str(tmp_path / "obs.db"))
+    monkeypatch.setattr(main_module, "rag_db_path", lambda: str(tmp_path / "rag.db"))
     monkeypatch.setattr(main_module, "obs_web_port", lambda: 8765)
     # Веб-дашборд — заглушки lifecycle, чтобы не открывать реальный порт в тестах
     monkeypatch.setattr(main_module, "build_app", lambda store, **kw: ("web_app", store))
@@ -563,6 +571,7 @@ async def test_main_busy_web_port_stops_before_polling(fake_bot, monkeypatch, tm
     monkeypatch.setattr(main_module, "SandboxExecutor", lambda: executor)
     monkeypatch.setattr(main_module, "memory_db_path", lambda: str(tmp_path / "m.db"))
     monkeypatch.setattr(main_module, "obs_db_path", lambda: str(tmp_path / "obs.db"))
+    monkeypatch.setattr(main_module, "rag_db_path", lambda: str(tmp_path / "rag.db"))
     monkeypatch.setattr(main_module, "obs_web_port", lambda: 8765)
     monkeypatch.setattr(main_module, "build_app", lambda store, **kw: "web_app")
     monkeypatch.setattr(main_module, "start_app", fake_start_app)

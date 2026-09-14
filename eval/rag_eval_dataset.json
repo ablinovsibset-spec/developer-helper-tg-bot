@@ -1,0 +1,55 @@
+{
+  "description": "Evaluation dataset для retrieval по документам (change add-document-rag, задача 5.2). Каждый вопрос указывает ожидаемый документ-источник и фрагмент текста, который должен попасть в Top-K. Корпус — eval/documents/*.md. Проверяется автоматически: tests/unit/test_rag_eval.py.",
+  "documents_dir": "documents",
+  "top_k": 5,
+  "questions": [
+    {
+      "id": "vacation-duration",
+      "question": "Сколько календарных дней ежегодного оплачиваемого отпуска положено сотруднику?",
+      "expected_source": "vacation_policy.md",
+      "expected_fragment": "28 календарных дней"
+    },
+    {
+      "id": "vacation-notice",
+      "question": "За сколько недель до начала отпуска нужно подать заявление руководителю?",
+      "expected_source": "vacation_policy.md",
+      "expected_fragment": "за две недели"
+    },
+    {
+      "id": "expense-receipts",
+      "question": "В какой срок нужно загрузить чеки по командировочным тратам после поездки?",
+      "expected_source": "expense_policy.md",
+      "expected_fragment": "пяти рабочих дней"
+    },
+    {
+      "id": "expense-hotel",
+      "question": "Какая максимальная стоимость гостиницы за ночь возмещается в командировке?",
+      "expected_source": "expense_policy.md",
+      "expected_fragment": "8000 рублей за ночь"
+    },
+    {
+      "id": "onboarding-access",
+      "question": "Кто открывает новичку доступ к репозиториям кода и когда выдают ноутбук?",
+      "expected_source": "onboarding_guide.md",
+      "expected_fragment": "тимлид"
+    },
+    {
+      "id": "security-password",
+      "question": "Какая минимальная длина пароля и обязательна ли двухфакторная аутентификация?",
+      "expected_source": "security_policy.md",
+      "expected_fragment": "14 символов"
+    },
+    {
+      "id": "security-secrets",
+      "question": "Можно ли коммитить токены и ключи доступа в репозиторий?",
+      "expected_source": "security_policy.md",
+      "expected_fragment": "запрещено коммитить"
+    },
+    {
+      "id": "remote-days",
+      "question": "Сколько дней в неделю разрешено работать удалённо и какие дни офисные?",
+      "expected_source": "remote_work_policy.md",
+      "expected_fragment": "трёх дней в неделю"
+    }
+  ]
+}

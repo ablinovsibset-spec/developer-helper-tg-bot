@@ -1,11 +1,14 @@
 # Общие pytest-фикстуры для всего набора тестов.
 from __future__ import annotations
 
+import hashlib
+import math
 import re
 from typing import Any
 
 import pytest
 
+from dev_helper_bot.embeddings import EmbeddingsUnavailable
 from dev_helper_bot.llm import (
     AssistantTurn,
     Message,
@@ -16,6 +19,9 @@ from dev_helper_bot.llm import (
 from dev_helper_bot.tools import EXEC_TIMEOUT_SECONDS, ExecResult
 
 
+DEFAULT_USER_ID = 777
+
+
 class FakeChat:
     """Минимальный двойник aiogram Chat: используется только .id."""
 
@@ -23,22 +29,62 @@ class FakeChat:
         self.id = chat_id
 
 
-class FakeMessage:
-    """Минимальный двойник aiogram Message: используются .text и .chat.id."""
+class FakeUser:
+    """Двойник aiogram User: владелец документов — только .id (design D3)."""
 
-    def __init__(self, text: str, chat_id: int) -> None:
+    def __init__(self, user_id: int) -> None:
+        self.id = user_id
+
+
+class FakeDocument:
+    """Двойник aiogram Document: имя, размер и байты для скачивания."""
+
+    def __init__(
+        self,
+        file_name: str | None,
+        data: bytes = b"",
+        file_size: int | None = None,
+    ) -> None:
+        self.file_name = file_name
+        self.data = data
+        self.file_size = len(data) if file_size is None else file_size
+        self.file_id = f"file-{file_name}"
+
+
+class FakeMessage:
+    """Минимальный двойник aiogram Message: .text, .chat.id, .from_user.id
+    и .document для загрузки документов."""
+
+    def __init__(
+        self,
+        text: str | None = None,
+        chat_id: int = 0,
+        user_id: int | None = None,
+        document: FakeDocument | None = None,
+    ) -> None:
         self.text = text
         self.chat = FakeChat(chat_id)
+        self.from_user = FakeUser(DEFAULT_USER_ID if user_id is None else user_id)
+        self.document = document
 
 
 class FakeBot:
-    """Двойник aiogram Bot: записывает все отправленные сообщения."""
+    """Двойник aiogram Bot: записывает отправленные сообщения и отдаёт
+    байты «скачанного» документа из самого двойника документа."""
 
-    def __init__(self) -> None:
+    def __init__(self, download_error: Exception | None = None) -> None:
         self.sent: list[dict[str, Any]] = []
+        self.download_error = download_error
 
     async def send_message(self, chat_id: int, text: str) -> None:
         self.sent.append({"chat_id": chat_id, "text": text})
+
+    async def download(self, document: Any, destination: Any) -> Any:
+        if self.download_error is not None:
+            raise self.download_error
+        destination.write(document.data)
+        destination.seek(0)
+        return destination
 
 
 class FakeLLM:
@@ -197,6 +243,63 @@ class BrokenHistorySearcher:
 
     async def list_sessions(self) -> str:
         raise RuntimeError("database is closed")
+
+
+FAKE_EMBEDDING_DIM = 256
+
+
+def _tokenize(text: str) -> list[str]:
+    return re.findall(r"\w+", text.lower())
+
+
+class FakeEmbeddingClient:
+    """Двойник EmbeddingClient: векторы без сети, ключей и моделей.
+
+    Хешированный bag-of-words: токен попадает в бакет по стабильному хешу
+    (blake2b, а не рандомизированный hash()), вектор нормируется. Отсюда
+    два свойства, на которые опираются тесты: один и тот же текст даёт один
+    и тот же вектор, а лексическое пересечение запроса и чанка повышает
+    близость — значит retrieval проверяется на релевантности, а не на шуме.
+    """
+
+    def __init__(self, dimension: int = FAKE_EMBEDDING_DIM) -> None:
+        self._dimension = dimension
+        self.calls: list[list[str]] = []
+
+    @property
+    def dimension(self) -> int:
+        return self._dimension
+
+    async def embed(self, texts: list[str]) -> list[list[float]]:
+        self.calls.append(list(texts))
+        return [self._vector(text) for text in texts]
+
+    def _vector(self, text: str) -> list[float]:
+        vector = [0.0] * self._dimension
+        for token in _tokenize(text):
+            digest = hashlib.blake2b(token.encode("utf-8"), digest_size=8).digest()
+            vector[int.from_bytes(digest, "big") % self._dimension] += 1.0
+        norm = math.sqrt(sum(value * value for value in vector))
+        if norm == 0.0:
+            # Текст без словарных токенов: единичный вектор, чтобы косинусная
+            # метрика оставалась определённой.
+            vector[0] = 1.0
+            return vector
+        return [value / norm for value in vector]
+
+
+class BrokenEmbeddingClient:
+    """Двойник шва эмбеддингов с недоступным провайдером."""
+
+    def __init__(self, dimension: int = FAKE_EMBEDDING_DIM) -> None:
+        self._dimension = dimension
+
+    @property
+    def dimension(self) -> int:
+        return self._dimension
+
+    async def embed(self, texts: list[str]) -> list[list[float]]:
+        raise EmbeddingsUnavailable("embeddings endpoint is down")
 
 
 @pytest.fixture

@@ -12,6 +12,7 @@ READ_FILE_TOOL_NAME = "read_file"
 GET_SKILL_TOOL_NAME = "get_skill"
 SEARCH_TOOL_NAME = "search_history"
 LIST_TOOL_NAME = "list_sessions"
+SEARCH_DOCUMENTS_TOOL_NAME = "search_documents"
 EXEC_TIMEOUT_SECONDS = 30.0
 OUTPUT_LIMIT = 3000
 HEAD_CHARS = 1500
@@ -124,6 +125,34 @@ LIST_TOOL_SPEC: dict[str, Any] = {
     },
 }
 
+SEARCH_DOCUMENTS_TOOL_SPEC: dict[str, Any] = {
+    "type": "function",
+    "function": {
+        "name": SEARCH_DOCUMENTS_TOOL_NAME,
+        "description": (
+            "Семантический поиск по документам, которые пользователь "
+            "загрузил в бота (.txt, .md, .docx, .pdf). Возвращает наиболее "
+            "релевантные фрагменты с именем файла-источника. Вызывай при "
+            "любом вопросе о содержании документов, политик, инструкций "
+            "и приложенных файлов. В ответе указывай источник: имя файла. "
+            "Если фрагментов нет — скажи, что в загруженных документах "
+            "этого нет, и не подменяй их общими знаниями."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": (
+                        "Вопрос или ключевая формулировка на языке документа"
+                    ),
+                },
+            },
+            "required": ["query"],
+        },
+    },
+}
+
 GET_SKILL_TOOL_SPEC: dict[str, Any] = {
     "type": "function",
     "function": {
@@ -185,6 +214,19 @@ class HistorySearcher(Protocol):
     async def search(self, query: str) -> str: ...
 
     async def list_sessions(self) -> str: ...
+
+
+class DocumentSearcher(Protocol):
+    """Шов поиска по документам текущего пользователя (change add-document-rag).
+
+    Продакшн-реализация — document_store.UserDocumentSearcher: эмбеддинг
+    запроса плюс KNN по индексу, привязанный к владельцу документов
+    (Telegram user_id отправителя, design D3); в unit-тестах инъектируется
+    двойник. Retrieval идёт только через этот вызов модели — документы
+    не подставляются в системный промпт (design D6).
+    """
+
+    async def search(self, query: str) -> str: ...
 
 
 def truncate_output(text: str) -> str:
