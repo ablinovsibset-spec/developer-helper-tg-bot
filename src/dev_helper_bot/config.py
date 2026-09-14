@@ -7,8 +7,8 @@ from dev_helper_bot.embeddings.openai_compat import OpenAICompatibleEmbeddingCli
 from dev_helper_bot.llm import LLMClient, LLMUnavailable
 from dev_helper_bot.llm.openai_compat import OpenAICompatibleClient
 
-DEFAULT_BASE_URL = "http://localhost:1234/v1"
-DEFAULT_MODEL = "openai/gpt-oss-20b"
+DEFAULT_BASE_URL = "https://routerai.ru/api/v1"
+DEFAULT_MODEL = "openai/gpt-5.6-luna"
 DEFAULT_PROVIDER = "openai_compatible"
 
 DEFAULT_MEMORY_DB_PATH = "~/.local/share/dev-helper-bot/memory.db"
@@ -37,10 +37,10 @@ DEFAULT_RAG_MAX_CHUNKS_PER_DOC = 800
 
 DEFAULT_OBS_PRICE_INPUT_PER_M = 0.11
 DEFAULT_OBS_PRICE_OUTPUT_PER_M = 0.60
-"""Дефолтный виртуальный прайс $/1M токенов — цены запуска gpt-oss-20b
-в API OpenAI (design D5). Локальная модель реально стоит $0: стоимость
-учётная, для сопоставимости экспериментов «до/после»; переопределяется
-OBS_PRICE_INPUT_PER_M / OBS_PRICE_OUTPUT_PER_M."""
+"""Учётная величина виртуального прайса $/1M токенов (0.11 вход / 0.60 выход)
+для сопоставимости экспериментов «до/после», а не цена текущей дефолтной
+модели (design D6). Переопределяется OBS_PRICE_INPUT_PER_M /
+OBS_PRICE_OUTPUT_PER_M."""
 
 
 def make_llm() -> LLMClient:

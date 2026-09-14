@@ -63,7 +63,7 @@ def clean_llm_env(monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.delenv(var, raising=False)
 
 
-def test_make_llm_defaults_to_local_openai_compatible():
+def test_make_llm_defaults_to_openai_compatible():
     client = make_llm()
 
     assert isinstance(client, OpenAICompatibleClient)
@@ -73,9 +73,9 @@ def test_make_llm_defaults_to_local_openai_compatible():
     assert client._timeout == 120.0
 
 
-def test_llm_defaults_pin_gpt_oss_and_local_lm_studio():
-    assert DEFAULT_BASE_URL == "http://localhost:1234/v1"
-    assert DEFAULT_MODEL == "openai/gpt-oss-20b"
+def test_llm_defaults_pin_routerai_and_gpt_56_luna():
+    assert DEFAULT_BASE_URL == "https://routerai.ru/api/v1"
+    assert DEFAULT_MODEL == "openai/gpt-5.6-luna"
 
 
 def test_make_llm_unknown_provider_raises_value_error(monkeypatch: pytest.MonkeyPatch):
@@ -135,8 +135,8 @@ def test_obs_db_path_env_override_wins(monkeypatch: pytest.MonkeyPatch):
     assert obs_db_path() == "/tmp/custom-obs.db"
 
 
-def test_obs_price_defaults_document_gpt_oss_20b():
-    """Дефолтный прайс — цены запуска gpt-oss-20b в API OpenAI (design D5)."""
+def test_obs_price_defaults_are_accounting_values():
+    """Учётная величина, не прайс текущей дефолтной модели (design D6)."""
     assert DEFAULT_OBS_PRICE_INPUT_PER_M == 0.11
     assert DEFAULT_OBS_PRICE_OUTPUT_PER_M == 0.60
     assert obs_price_input_per_m() == 0.11
@@ -196,6 +196,19 @@ def test_embedding_model_is_configured_apart_from_chat_model(
     assert embedding_dim() == 1536
 
 
+def test_unset_embedding_model_does_not_inherit_chat_model(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """При незаданном EMBEDDING_MODEL клиент берёт baai/bge-m3, не chat-модель."""
+    monkeypatch.setenv("LLM_MODEL", "openai/gpt-5.6-luna")
+
+    client = make_embeddings()
+
+    assert llm_model_name() == "openai/gpt-5.6-luna"
+    assert client._model == "baai/bge-m3"
+    assert embedding_model_name() == DEFAULT_EMBEDDING_MODEL
+
+
 def test_make_embeddings_reuses_llm_endpoint_and_key_by_default(
     monkeypatch: pytest.MonkeyPatch,
 ):
@@ -211,11 +224,24 @@ def test_make_embeddings_reuses_llm_endpoint_and_key_by_default(
     assert client.dimension == DEFAULT_EMBEDDING_DIM
 
 
-def test_make_embeddings_defaults_to_local_endpoint():
+def test_make_embeddings_defaults_to_chat_endpoint():
     client = make_embeddings()
 
     assert client._base_url == DEFAULT_BASE_URL
     assert client._api_key is None
+
+
+def test_embeddings_inherit_chat_endpoint_and_key_when_embedding_overrides_unset(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """EMBEDDING_BASE_URL / EMBEDDING_API_KEY не заданы — берём chat URL и ключ."""
+    monkeypatch.setenv("LLM_BASE_URL", "https://chat.example/v1")
+    monkeypatch.setenv("LLM_API_KEY", "sk-chat")
+
+    client = make_embeddings()
+
+    assert client._base_url == "https://chat.example/v1"
+    assert client._api_key == "sk-chat"
 
 
 def test_make_embeddings_separate_provider_overrides_win(
