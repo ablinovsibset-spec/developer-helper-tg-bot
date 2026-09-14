@@ -61,6 +61,60 @@ def docx_bytes(paragraphs: list[str]) -> bytes:
     return buffer.getvalue()
 
 
+def pdf_bytes(*pages: str) -> bytes:
+    """Минимальный PDF 1.4 с текстовым слоем (латиница, Helvetica).
+
+    Кириллица в Type1 Helvetica недоступна — для проверки страниц достаточно
+    латинских маркеров, которые pypdf извлекает как есть.
+    """
+    n = len(pages)
+    font_id = 3 + 2 * n
+    bodies: list[bytes] = []
+
+    def body(content: str) -> bytes:
+        return content.encode("latin-1")
+
+    kids = " ".join(f"{3 + i} 0 R" for i in range(n))
+    bodies.append(body("<< /Type /Catalog /Pages 2 0 R >>"))
+    bodies.append(body(f"<< /Type /Pages /Kids [{kids}] /Count {n} >>"))
+    for i in range(n):
+        content_id = 3 + n + i
+        bodies.append(
+            body(
+                f"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
+                f"/Contents {content_id} 0 R "
+                f"/Resources << /Font << /F1 {font_id} 0 R >> >> >>"
+            )
+        )
+    for text in pages:
+        escaped = (
+            text.replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
+        )
+        stream = f"BT /F1 12 Tf 72 720 Td ({escaped}) Tj ET"
+        stream_bytes = stream.encode("latin-1")
+        bodies.append(
+            body(f"<< /Length {len(stream_bytes)} >>\nstream\n")
+            + stream_bytes
+            + b"\nendstream"
+        )
+    bodies.append(body("<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>"))
+
+    chunks = [b"%PDF-1.4\n"]
+    offsets = [0]
+    for index, payload in enumerate(bodies, start=1):
+        offsets.append(sum(len(chunk) for chunk in chunks))
+        chunks.append(f"{index} 0 obj\n".encode("latin-1") + payload + b"\nendobj\n")
+    xref_at = sum(len(chunk) for chunk in chunks)
+    xref = [f"xref\n0 {len(bodies) + 1}\n", "0000000000 65535 f \n"]
+    for offset in offsets[1:]:
+        xref.append(f"{offset:010d} 00000 n \n")
+    trailer = (
+        f"trailer\n<< /Size {len(bodies) + 1} /Root 1 0 R >>\n"
+        f"startxref\n{xref_at}\n%%EOF\n"
+    )
+    return b"".join(chunks) + "".join(xref).encode("latin-1") + trailer.encode("latin-1")
+
+
 # --- Формат и извлечение текста (задача 3.1) ---
 
 
@@ -208,7 +262,9 @@ def test_split_document_end_to_end_returns_chunks():
         max_chunks=100,
     )
 
-    assert chunks == [POLICY_TEXT]
+    assert [chunk.text for chunk in chunks] == [POLICY_TEXT]
+    assert chunks[0].page_start is None
+    assert chunks[0].page_end is None
 
 
 def test_split_document_rejects_text_over_char_limit():
@@ -223,3 +279,63 @@ def test_split_document_rejects_too_many_chunks():
 
     with pytest.raises(DocumentTooLarge, match="фрагментов"):
         split_document("policy.txt", data, max_chars=1_000_000, max_chunks=2)
+
+
+# --- Страницы PDF (change add-rag-bonus, задача 1.2) ---
+
+
+def test_extract_text_pdf_concatenates_pages():
+    data = pdf_bytes("First page token ALPHA", "Second page token BETA")
+
+    text = extract_text("report.pdf", data)
+
+    assert "ALPHA" in text
+    assert "BETA" in text
+
+
+def test_pdf_chunk_on_one_page_keeps_that_page_number():
+    """Короткий PDF целиком на странице 1 — у фрагмента page_start=page_end=1."""
+    data = pdf_bytes("Vacation policy lives only on page one.")
+
+    chunks = split_document("policy.pdf", data, max_chars=10_000, max_chunks=100)
+
+    assert chunks
+    assert all(chunk.page_start == 1 and chunk.page_end == 1 for chunk in chunks)
+    assert "Vacation policy" in chunks[0].text
+
+
+def test_pdf_chunk_crossing_pages_keeps_page_range():
+    """Маленькое окно на стыке страниц даёт диапазон page_start != page_end."""
+    page_one = "ONE " * 40
+    page_two = "TWO " * 40
+    data = pdf_bytes(page_one, page_two)
+
+    chunks = split_document(
+        "report.pdf",
+        data,
+        max_chars=10_000,
+        max_chunks=100,
+        size=80,
+        overlap=20,
+    )
+
+    spanning = [chunk for chunk in chunks if chunk.page_start != chunk.page_end]
+    assert spanning, f"ожидался фрагмент на стыке, получили {chunks!r}"
+    assert spanning[0].page_start == 1
+    assert spanning[0].page_end == 2
+
+
+def test_non_pdf_chunks_have_no_page_numbers():
+    txt = split_document(
+        "notes.txt", b"plain text without pages", max_chars=1000, max_chunks=10
+    )
+    md = split_document(
+        "notes.md", b"# heading without pages", max_chars=1000, max_chunks=10
+    )
+    docx = split_document(
+        "notes.docx", docx_bytes(["paragraph without pages"]), max_chars=1000, max_chunks=10
+    )
+
+    for chunks in (txt, md, docx):
+        assert chunks
+        assert all(chunk.page_start is None and chunk.page_end is None for chunk in chunks)

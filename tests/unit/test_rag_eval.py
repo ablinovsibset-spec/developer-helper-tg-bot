@@ -77,7 +77,9 @@ def test_eval_corpus_is_present_and_indexable():
 async def test_expected_source_is_in_top_k(question, indexed_store, embeddings):
     """Для каждого вопроса ожидаемый источник обязан попасть в Top-K."""
     vectors = await embeddings.embed([question["question"]])
-    matches = await indexed_store.search(USER_ID, vectors[0], k=TOP_K)
+    matches = await indexed_store.retrieve(
+        USER_ID, question["question"], vectors[0], k=TOP_K
+    )
 
     sources = [match.filename for match in matches]
     assert question["expected_source"] in sources, (
@@ -94,7 +96,9 @@ async def test_expected_source_is_in_top_k(question, indexed_store, embeddings):
 async def test_expected_fragment_is_retrieved(question, indexed_store, embeddings):
     """Мало вернуть нужный файл — в Top-K должен попасть сам факт."""
     vectors = await embeddings.embed([question["question"]])
-    matches = await indexed_store.search(USER_ID, vectors[0], k=TOP_K)
+    matches = await indexed_store.retrieve(
+        USER_ID, question["question"], vectors[0], k=TOP_K
+    )
 
     texts = [
         match.text
@@ -112,4 +116,6 @@ async def test_eval_retrieval_respects_user_isolation(indexed_store, embeddings)
     и на полном наборе документов."""
     vectors = await embeddings.embed([QUESTIONS[0]["question"]])
 
-    assert await indexed_store.search(USER_ID + 1, vectors[0], k=TOP_K) == []
+    assert await indexed_store.retrieve(
+        USER_ID + 1, QUESTIONS[0]["question"], vectors[0], k=TOP_K
+    ) == []

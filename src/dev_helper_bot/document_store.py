@@ -1,11 +1,11 @@
 """Персистентный индекс документов на SQLite + sqlite-vec
-(change add-document-rag, design D1/D2/D10).
+(change add-document-rag, design D1/D2/D10; бонусы — add-rag-bonus).
 
 Отдельный от переписки файл БД на VM-локальном диске: у индекса другой
 lifecycle и своё расширение SQLite. Владелец каждого документа — Telegram
 `user_id` (design D3), и он же PARTITION KEY векторной таблицы: KNN физически
 не выходит за документы своего пользователя, а не фильтрует чужое после
-поиска.
+поиска. Текстовый канал — FTS5 по chunks с тем же фильтром `user_id`.
 
 Драйвер соединения — `sqlean.py`, а не stdlib `sqlite3` (design D10): многие
 сборки CPython собраны без загрузки расширений, и sqlite-vec на них не
@@ -13,6 +13,8 @@ lifecycle и своё расширение SQLite. Владелец каждог
 """
 from __future__ import annotations
 
+import logging
+import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -21,11 +23,20 @@ import aiosqlite
 import sqlean
 import sqlite_vec
 
+from dev_helper_bot.documents import TextChunk
 from dev_helper_bot.embeddings import EmbeddingClient, EmbeddingsUnavailable
+
+log = logging.getLogger(__name__)
 
 DEFAULT_SEARCH_K = 5
 """Top-K по умолчанию (design D7): хватает для attribution и не раздувает
 результат инструмента под бюджет компакции агентного цикла."""
+
+CANDIDATE_K = 15
+"""Ширина каждого канала до RRF (add-rag-bonus D5): шире финального Top-K."""
+
+RRF_K = 60
+"""Константа Reciprocal Rank Fusion: вклад канала = 1/(60 + rank)."""
 
 SEARCH_SNIPPET_CHARS = 600
 """Потолок одного фрагмента в результате инструмента: Top-K фрагментов
@@ -45,6 +56,8 @@ SEARCH_NO_DOCUMENTS_MESSAGE = (
     "Предложи прислать файл (.txt, .md, .docx, .pdf)."
 )
 
+_FTS_TOKEN = re.compile(r"[0-9A-Za-zА-Яа-яЁё_]+", re.UNICODE)
+
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS documents (
     id INTEGER PRIMARY KEY,
@@ -58,11 +71,18 @@ CREATE TABLE IF NOT EXISTS chunks (
     id INTEGER PRIMARY KEY,
     document_id INTEGER NOT NULL REFERENCES documents(id),
     chunk_index INTEGER NOT NULL,
-    text TEXT NOT NULL
+    text TEXT NOT NULL,
+    page_start INTEGER,
+    page_end INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_chunks_document ON chunks(document_id, chunk_index);
 CREATE INDEX IF NOT EXISTS idx_documents_user ON documents(user_id, filename);
 """
+
+_FTS_SCHEMA = (
+    "CREATE VIRTUAL TABLE IF NOT EXISTS chunk_fts USING fts5("
+    "text, content='chunks', content_rowid='id')"
+)
 
 _VEC_SCHEMA_TEMPLATE = (
     "CREATE VIRTUAL TABLE IF NOT EXISTS chunk_vectors USING vec0("
@@ -72,7 +92,8 @@ _VEC_SCHEMA_TEMPLATE = (
 )
 
 _SEARCH_SQL = (
-    "SELECT d.filename, c.chunk_index, c.text, m.distance FROM ("
+    "SELECT c.id, d.filename, c.chunk_index, c.text, m.distance, "
+    "c.page_start, c.page_end FROM ("
     " SELECT chunk_id, distance FROM chunk_vectors"
     " WHERE embedding MATCH ? AND user_id = ? AND k = ?"
     ") m "
@@ -80,6 +101,17 @@ _SEARCH_SQL = (
     "JOIN documents d ON d.id = c.document_id "
     "WHERE d.user_id = ? "
     "ORDER BY m.distance"
+)
+
+_FTS_SQL = (
+    "SELECT c.id, d.filename, c.chunk_index, c.text, "
+    "c.page_start, c.page_end "
+    "FROM chunk_fts "
+    "JOIN chunks c ON c.id = chunk_fts.rowid "
+    "JOIN documents d ON d.id = c.document_id "
+    "WHERE chunk_fts MATCH ? AND d.user_id = ? "
+    "ORDER BY rank "
+    "LIMIT ?"
 )
 
 _LIST_SQL = (
@@ -92,7 +124,7 @@ _LIST_SQL = (
 
 
 class DocumentStoreUnavailable(RuntimeError):
-    """Индекс документов нельзя открыть: нет расширения sqlite-vec или файл
+    """Индекс документов нельзя открыть: нет sqlite-vec / FTS5 или файл
     создан под другую размерность векторов. Fail-fast при старте (design D10):
     RAG — обязательная часть бота, молча работать без него нечестно."""
 
@@ -114,10 +146,46 @@ class ChunkMatch:
     chunk_index: int
     text: str
     distance: float
+    page_start: int | None = None
+    page_end: int | None = None
+    chunk_id: int = 0
 
 
 def _utcnow_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def sanitize_fts_query(query: str) -> str:
+    """Литералы MATCH: слова в кавычках через OR, без операторов FTS5."""
+    tokens = _FTS_TOKEN.findall(query)
+    if not tokens:
+        return ""
+    return " OR ".join(f'"{token}"' for token in tokens[:32])
+
+
+async def fts5_is_available(db: aiosqlite.Connection) -> bool:
+    """Есть ли FTS5 в этой сборке SQLite (sqlean)."""
+    try:
+        cursor = await db.execute("SELECT sqlite_compileoption_used('ENABLE_FTS5')")
+        row = await cursor.fetchone()
+    except Exception:
+        return False
+    return bool(row and row[0])
+
+
+def rrf_score(rank: int, k: int = RRF_K) -> float:
+    return 1.0 / (k + rank)
+
+
+def lexical_rerank_score(query: str, text: str, rrf: float) -> float:
+    """RRF + точное вхождение строки запроса + перекрытие токенов (D5)."""
+    query_l = query.lower().strip()
+    text_l = text.lower()
+    exact = 1.0 if query_l and query_l in text_l else 0.0
+    q_tokens = set(re.findall(r"\w+", query_l, flags=re.UNICODE))
+    t_tokens = set(re.findall(r"\w+", text_l, flags=re.UNICODE))
+    overlap = (len(q_tokens & t_tokens) / len(q_tokens)) if q_tokens else 0.0
+    return rrf + exact + overlap
 
 
 class DocumentStore:
@@ -137,7 +205,7 @@ class DocumentStore:
         return self._dimension
 
     async def open(self) -> None:
-        """Открывает/создаёт файл БД, грузит sqlite-vec, создаёт схему."""
+        """Открывает/создаёт файл БД, грузит sqlite-vec и FTS5, создаёт схему."""
         self._path.parent.mkdir(parents=True, exist_ok=True)
         self._db = aiosqlite.Connection(
             lambda: sqlean.connect(str(self._path)), iter_chunk_size=64
@@ -153,11 +221,43 @@ class DocumentStore:
                 f"Не удалось загрузить расширение sqlite-vec для {self._path}: "
                 f"{exc}. Проверьте, что установлены пакеты sqlite-vec и sqlean.py."
             ) from exc
+        if not await fts5_is_available(self._db):
+            await self.close()
+            raise DocumentStoreUnavailable(
+                f"В SQLite для {self._path} нет FTS5. "
+                "Проверьте, что установлен пакет sqlean.py со сборкой SQLite с FTS5."
+            )
         await self._db.execute("PRAGMA journal_mode=WAL")
         await self._db.executescript(_SCHEMA)
         await self._db.execute(_VEC_SCHEMA_TEMPLATE.format(dim=self._dimension))
+        await self._migrate_chunk_pages()
+        await self._ensure_fts()
         await self._db.commit()
         await self._ensure_dimension()
+
+    async def _migrate_chunk_pages(self) -> None:
+        """Добавляет page_start/page_end к уже существующей таблице chunks."""
+        cursor = await self._conn.execute("PRAGMA table_info(chunks)")
+        columns = {row[1] for row in await cursor.fetchall()}
+        if "page_start" not in columns:
+            await self._conn.execute(
+                "ALTER TABLE chunks ADD COLUMN page_start INTEGER"
+            )
+        if "page_end" not in columns:
+            await self._conn.execute(
+                "ALTER TABLE chunks ADD COLUMN page_end INTEGER"
+            )
+
+    async def _ensure_fts(self) -> None:
+        """Создаёт FTS и пересобирает индекс из chunks (миграция D8).
+
+        У content-таблицы SELECT/COUNT читают chunks, а не инвертированный
+        индекс: без `rebuild` MATCH на старом rag.db был бы пуст.
+        """
+        await self._conn.execute(_FTS_SCHEMA)
+        await self._conn.execute(
+            "INSERT INTO chunk_fts(chunk_fts) VALUES('rebuild')"
+        )
 
     async def _ensure_dimension(self) -> None:
         """Сверяет размерность существующей векторной таблицы с конфигом.
@@ -194,7 +294,7 @@ class DocumentStore:
         self,
         user_id: int,
         filename: str,
-        chunks: list[str],
+        chunks: list[str] | list[TextChunk],
         vectors: list[list[float]],
     ) -> int:
         """Пишет документ с его chunks и векторами; при совпадении имени
@@ -202,11 +302,15 @@ class DocumentStore:
 
         Удаление старого и вставка нового — одна транзакция с единственным
         commit: окно, в котором документ отсутствует в индексе, не видно
-        другим запросам.
+        другим запросам. FTS синхронизируется в той же транзакции, что vec.
         """
-        if len(chunks) != len(vectors):
+        normalized = [
+            item if isinstance(item, TextChunk) else TextChunk(text=item)
+            for item in chunks
+        ]
+        if len(normalized) != len(vectors):
             raise ValueError(
-                f"chunks/vectors mismatch: {len(chunks)} vs {len(vectors)}"
+                f"chunks/vectors mismatch: {len(normalized)} vs {len(vectors)}"
             )
         if any(len(vector) != self._dimension for vector in vectors):
             raise ValueError(
@@ -219,28 +323,39 @@ class DocumentStore:
             (user_id, filename, Path(filename).suffix.lower(), _utcnow_iso()),
         )
         document_id = cursor.lastrowid
-        for index, (text, vector) in enumerate(zip(chunks, vectors)):
+        for index, (chunk, vector) in enumerate(zip(normalized, vectors)):
             cursor = await self._conn.execute(
-                "INSERT INTO chunks (document_id, chunk_index, text) "
-                "VALUES (?, ?, ?)",
-                (document_id, index, text),
+                "INSERT INTO chunks (document_id, chunk_index, text, "
+                "page_start, page_end) VALUES (?, ?, ?, ?, ?)",
+                (
+                    document_id,
+                    index,
+                    chunk.text,
+                    chunk.page_start,
+                    chunk.page_end,
+                ),
             )
+            chunk_id = cursor.lastrowid
             await self._conn.execute(
                 "INSERT INTO chunk_vectors (chunk_id, embedding, user_id) "
                 "VALUES (?, ?, ?)",
                 (
-                    cursor.lastrowid,
+                    chunk_id,
                     sqlite_vec.serialize_float32(vector),
                     user_id,
                 ),
             )
+            await self._conn.execute(
+                "INSERT INTO chunk_fts(rowid, text) VALUES (?, ?)",
+                (chunk_id, chunk.text),
+            )
         await self._conn.commit()
-        return len(chunks)
+        return len(normalized)
 
     async def _delete_rows(self, user_id: int, filename: str) -> bool:
-        """Каскадное удаление векторов → chunks → документа (design D4).
+        """Каскадное удаление FTS → векторов → chunks → документа (design D4).
 
-        Каскад руками: vec0-таблица не участвует в foreign keys.
+        Каскад руками: vec0 и FTS не участвуют в foreign keys.
         Без commit — вызывающий решает, чем закрыть транзакцию.
         """
         cursor = await self._conn.execute(
@@ -251,6 +366,11 @@ class DocumentStore:
         if row is None:
             return False
         document_id = row[0]
+        await self._conn.execute(
+            "DELETE FROM chunk_fts WHERE rowid IN "
+            "(SELECT id FROM chunks WHERE document_id = ?)",
+            (document_id,),
+        )
         await self._conn.execute(
             "DELETE FROM chunk_vectors WHERE chunk_id IN "
             "(SELECT id FROM chunks WHERE document_id = ?)",
@@ -285,12 +405,13 @@ class DocumentStore:
         query_vector: list[float],
         k: int = DEFAULT_SEARCH_K,
     ) -> list[ChunkMatch]:
-        """Top-K ближайших фрагментов среди документов пользователя.
+        """Top-K ближайших фрагментов среди документов пользователя (vec KNN).
 
         Изоляция держится на PARTITION KEY векторной таблицы (design D2):
         KNN выполняется внутри партиции владельца. Условие по
         `documents.user_id` оставлено вторым контуром — утечка чужого
         фрагмента не должна зависеть от одной реализации.
+        Публичный отбор для инструмента — `retrieve` (гибрид + rerank).
         """
         if len(query_vector) != self._dimension:
             raise ValueError(
@@ -306,15 +427,97 @@ class DocumentStore:
             ),
         )
         rows = await cursor.fetchall()
-        return [
-            ChunkMatch(
-                filename=filename,
-                chunk_index=chunk_index,
-                text=text,
-                distance=distance,
+        return [_match_from_vec_row(row) for row in rows]
+
+    async def search_text(
+        self,
+        user_id: int,
+        query: str,
+        k: int = DEFAULT_SEARCH_K,
+    ) -> list[ChunkMatch]:
+        """Текстовый канал: FTS5 MATCH по chunks этого пользователя.
+
+        Ошибка MATCH не пробрасывается: канал молча пуст, чтобы гибридный
+        поиск не ронял агентный цикл (vec при этом остаётся).
+        """
+        match_query = sanitize_fts_query(query)
+        if not match_query:
+            return []
+        try:
+            cursor = await self._conn.execute(
+                _FTS_SQL, (match_query, user_id, max(1, k))
             )
-            for filename, chunk_index, text, distance in rows
-        ]
+            rows = await cursor.fetchall()
+        except Exception:
+            log.warning("FTS MATCH failed for query %r", query, exc_info=True)
+            return []
+        return [_match_from_fts_row(row) for row in rows]
+
+    async def retrieve(
+        self,
+        user_id: int,
+        query: str,
+        query_vector: list[float],
+        k: int = DEFAULT_SEARCH_K,
+    ) -> list[ChunkMatch]:
+        """Гибридный отбор: vec + FTS → RRF → лексический rerank → Top-K.
+
+        Кандидатный набор каждого канала шире финального k (CANDIDATE_K).
+        Чат-LLM не вызывается.
+        """
+        top_k = max(1, k)
+        candidate_k = max(CANDIDATE_K, top_k)
+        vec_matches = await self.search(user_id, query_vector, k=candidate_k)
+        fts_matches = await self.search_text(user_id, query, k=candidate_k)
+        merged = _rrf_merge(vec_matches, fts_matches)
+        ranked = sorted(
+            merged,
+            key=lambda item: lexical_rerank_score(query, item[0].text, item[1]),
+            reverse=True,
+        )
+        return [match for match, _rrf in ranked[:top_k]]
+
+
+def _match_from_vec_row(row: tuple) -> ChunkMatch:
+    chunk_id, filename, chunk_index, text, distance, page_start, page_end = row
+    return ChunkMatch(
+        filename=filename,
+        chunk_index=chunk_index,
+        text=text,
+        distance=distance,
+        page_start=page_start,
+        page_end=page_end,
+        chunk_id=chunk_id,
+    )
+
+
+def _match_from_fts_row(row: tuple) -> ChunkMatch:
+    chunk_id, filename, chunk_index, text, page_start, page_end = row
+    return ChunkMatch(
+        filename=filename,
+        chunk_index=chunk_index,
+        text=text,
+        distance=float("inf"),
+        page_start=page_start,
+        page_end=page_end,
+        chunk_id=chunk_id,
+    )
+
+
+def _rrf_merge(
+    vec_matches: list[ChunkMatch],
+    fts_matches: list[ChunkMatch],
+) -> list[tuple[ChunkMatch, float]]:
+    """Объединяет id фрагментов двух каналов через Reciprocal Rank Fusion."""
+    scores: dict[int, float] = {}
+    by_id: dict[int, ChunkMatch] = {}
+    for rank, match in enumerate(vec_matches, start=1):
+        by_id[match.chunk_id] = match
+        scores[match.chunk_id] = scores.get(match.chunk_id, 0.0) + rrf_score(rank)
+    for rank, match in enumerate(fts_matches, start=1):
+        by_id.setdefault(match.chunk_id, match)
+        scores[match.chunk_id] = scores.get(match.chunk_id, 0.0) + rrf_score(rank)
+    return [(by_id[chunk_id], score) for chunk_id, score in scores.items()]
 
 
 def _snippet(text: str, chars: int = SEARCH_SNIPPET_CHARS) -> str:
@@ -324,31 +527,46 @@ def _snippet(text: str, chars: int = SEARCH_SNIPPET_CHARS) -> str:
     return text[:chars] + "…"
 
 
+def page_label(match: ChunkMatch) -> str | None:
+    """«стр. N» или «стр. N–M»; None, если страницы нет — не выдумывать."""
+    if match.page_start is None:
+        return None
+    if match.page_end is None or match.page_end == match.page_start:
+        return f"стр. {match.page_start}"
+    return f"стр. {match.page_start}–{match.page_end}"
+
+
 def format_matches(matches: list[ChunkMatch], query: str) -> str:
     """Результат поиска для модели: фрагменты с явным источником.
 
-    Имя файла и номер фрагмента стоят перед текстом, чтобы attribution
-    («Источник: …») собиралась из того же сообщения, где взят факт.
-    Пустой результат — прямая инструкция не выдумывать (design D11).
+    Имя файла, страница PDF (если известна) и номер фрагмента стоят перед
+    текстом, чтобы attribution («Источник: …») собиралась из того же
+    сообщения, где взят факт. Пустой результат — прямая инструкция не
+    выдумывать (design D11).
     """
     if not matches:
         return SEARCH_NOT_FOUND_TEMPLATE.format(query=query)
     lines = [f"Найдено фрагментов: {len(matches)}"]
     for match in matches:
+        source = match.filename
+        page = page_label(match)
+        if page:
+            source = f"{source}, {page}"
         lines.append(
-            f"— [источник: {match.filename}, фрагмент {match.chunk_index + 1}]\n"
+            f"— [источник: {source}, фрагмент {match.chunk_index + 1}]\n"
             f"{_snippet(match.text)}"
         )
     return "\n".join(lines)
 
 
 class UserDocumentSearcher:
-    """Поиск по документам одного пользователя: эмбеддинг запроса + KNN.
+    """Поиск по документам одного пользователя: эмбеддинг запроса + retrieve.
 
     Реализует шов `tools.DocumentSearcher`, привязывая операцию к владельцу
     документов — `user_id` отправителя сообщения (design D3). Ошибка
     эмбеддингов возвращается текстом: недоступность поиска не должна
-    ронять агентный цикл.
+    ронять агентный цикл. Предыдущие реплики сессии подмешиваются в
+    поисковую строку (add-rag-bonus D6), контракт `search(query)` прежний.
     """
 
     def __init__(
@@ -357,18 +575,28 @@ class UserDocumentSearcher:
         embeddings: EmbeddingClient,
         user_id: int,
         k: int = DEFAULT_SEARCH_K,
+        conversation_context: str = "",
     ) -> None:
         self._store = store
         self._embeddings = embeddings
         self._user_id = user_id
         self._k = k
+        self._conversation_context = conversation_context.strip()
+
+    def _retrieval_query(self, query: str) -> str:
+        if not self._conversation_context:
+            return query
+        return f"{self._conversation_context}\n{query}"
 
     async def search(self, query: str) -> str:
         if not await self._store.list_documents(self._user_id):
             return SEARCH_NO_DOCUMENTS_MESSAGE
+        retrieval_query = self._retrieval_query(query)
         try:
-            vectors = await self._embeddings.embed([query])
+            vectors = await self._embeddings.embed([retrieval_query])
         except EmbeddingsUnavailable:
             return SEARCH_EMBEDDINGS_ERROR
-        matches = await self._store.search(self._user_id, vectors[0], self._k)
+        matches = await self._store.retrieve(
+            self._user_id, retrieval_query, vectors[0], self._k
+        )
         return format_matches(matches, query)

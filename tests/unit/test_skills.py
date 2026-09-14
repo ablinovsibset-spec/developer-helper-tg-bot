@@ -197,6 +197,8 @@ def test_documents_env_line_instructs_search_attribution_and_refusal():
     assert prompt.index(MEMORY_ENV_LINE) < prompt.index(DOCUMENTS_ENV_LINE)
     assert "search_documents" in prompt
     assert "Источник:" in prompt
+    assert "стр." in prompt
+    assert "самодостаточным query" in prompt
     assert "не выдавай общие знания" in prompt
 
 

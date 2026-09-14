@@ -19,6 +19,9 @@ from dev_helper_bot.main import (
     DOCUMENTS_LIST_HEADER,
     EMBEDDINGS_ERROR_MESSAGE,
     INDEXED_MESSAGE,
+    INDEXING_CHUNKS_MESSAGE,
+    INDEXING_EMBED_MESSAGE,
+    INDEXING_EXTRACT_MESSAGE,
     INDEXING_MESSAGE,
     UNSUPPORTED_DOCUMENT_MESSAGE,
     handle_delete,
@@ -101,6 +104,14 @@ async def index_via_handler(
 ) -> None:
     await handle_document(message, fake_bot, documents, embeddings)
     fake_bot.sent.clear()
+    fake_bot.edits.clear()
+
+
+def last_chat_text(bot) -> str:
+    """Последний текст статуса: edit, если был, иначе исходная отправка."""
+    if bot.edits:
+        return bot.edits[-1]["text"]
+    return bot.sent[-1]["text"]
 
 
 # --- Загрузка документа (задача 4.1) ---
@@ -111,16 +122,26 @@ async def test_upload_notifies_start_then_ready(fake_bot, documents, embeddings)
         upload("vacation_policy.txt"), fake_bot, documents, embeddings
     )
 
-    assert fake_bot.sent == [
-        {
-            "chat_id": CHAT_ID,
-            "text": INDEXING_MESSAGE.format(filename="vacation_policy.txt"),
-        },
-        {
-            "chat_id": CHAT_ID,
-            "text": INDEXED_MESSAGE.format(filename="vacation_policy.txt", count=1),
-        },
-    ]
+    assert fake_bot.sent[0] == {
+        "chat_id": CHAT_ID,
+        "text": INDEXING_MESSAGE.format(filename="vacation_policy.txt"),
+    }
+    assert len(fake_bot.sent) == 1  # шаги — edit одного сообщения, не пачка
+    texts = [edit["text"] for edit in fake_bot.edits]
+    assert INDEXING_EXTRACT_MESSAGE.format(filename="vacation_policy.txt") in texts
+    assert (
+        INDEXING_CHUNKS_MESSAGE.format(filename="vacation_policy.txt", count=1)
+        in texts
+    )
+    assert (
+        INDEXING_EMBED_MESSAGE.format(
+            filename="vacation_policy.txt", done=1, total=1
+        )
+        in texts
+    )
+    assert texts[-1] == INDEXED_MESSAGE.format(
+        filename="vacation_policy.txt", count=1
+    )
     assert [info.filename for info in await documents.list_documents(ALICE)] == [
         "vacation_policy.txt"
     ]
@@ -135,7 +156,7 @@ async def test_upload_indexes_docx(fake_bot, documents, embeddings):
 
     await handle_document(message, fake_bot, documents, embeddings)
 
-    assert "проиндексирован" in fake_bot.sent[-1]["text"]
+    assert "проиндексирован" in last_chat_text(fake_bot)
     assert len(await documents.list_documents(ALICE)) == 1
 
 
@@ -158,7 +179,7 @@ async def test_upload_empty_document_reports_error_and_leaves_no_index(
 ):
     await handle_document(upload("empty.txt", "   \n  "), fake_bot, documents, embeddings)
 
-    assert "Не удалось проиндексировать" in fake_bot.sent[-1]["text"]
+    assert "Не удалось проиндексировать" in last_chat_text(fake_bot)
     assert await documents.list_documents(ALICE) == []
 
 
@@ -171,7 +192,7 @@ async def test_upload_corrupted_docx_reports_error(fake_bot, documents, embeddin
 
     await handle_document(message, fake_bot, documents, embeddings)
 
-    assert "Не удалось проиндексировать" in fake_bot.sent[-1]["text"]
+    assert "Не удалось проиндексировать" in last_chat_text(fake_bot)
     assert await documents.list_documents(ALICE) == []
 
 
@@ -200,7 +221,7 @@ async def test_upload_over_chunk_limit_is_not_indexed(
 
     await handle_document(upload("handbook.md", text), fake_bot, documents, embeddings)
 
-    assert "фрагментов при допустимых" in fake_bot.sent[-1]["text"]
+    assert "фрагментов при допустимых" in last_chat_text(fake_bot)
     assert await documents.list_documents(ALICE) == []
 
 
@@ -211,7 +232,7 @@ async def test_upload_embeddings_outage_reports_and_leaves_no_index(
         upload("vacation_policy.txt"), fake_bot, documents, BrokenEmbeddingClient()
     )
 
-    assert fake_bot.sent[-1]["text"] == EMBEDDINGS_ERROR_MESSAGE.format(
+    assert last_chat_text(fake_bot) == EMBEDDINGS_ERROR_MESSAGE.format(
         filename="vacation_policy.txt"
     )
     assert await documents.list_documents(ALICE) == []
@@ -224,7 +245,7 @@ async def test_upload_download_failure_reports_error(documents, embeddings):
 
     await handle_document(upload("vacation_policy.txt"), bot, documents, embeddings)
 
-    assert "Не удалось скачать" in bot.sent[-1]["text"]
+    assert "Не удалось скачать" in last_chat_text(bot)
     assert await documents.list_documents(ALICE) == []
 
 
@@ -524,3 +545,96 @@ async def test_missing_sqlite_vec_extension_fails_fast_on_open(tmp_path, monkeyp
 
     with pytest.raises(DocumentStoreUnavailable, match="sqlite-vec"):
         await store.open()
+
+
+async def test_missing_fts5_fails_fast_on_open(tmp_path, embeddings, monkeypatch):
+    import dev_helper_bot.document_store as store_module
+
+    async def no_fts(_db):
+        return False
+
+    monkeypatch.setattr(store_module, "fts5_is_available", no_fts)
+    store = DocumentStore(tmp_path / "rag.db", embeddings.dimension)
+
+    with pytest.raises(DocumentStoreUnavailable, match="FTS5"):
+        await store.open()
+
+
+async def test_upload_embedding_progress_shows_k_of_n(
+    fake_bot, documents, embeddings, monkeypatch
+):
+    monkeypatch.setattr(main_module, "EMBEDDING_BATCH_SIZE", 2)
+    text = " ".join(
+        f"пункт{i:03d} политики компании про отпуск и работу сотрудника"
+        for i in range(80)
+    )
+
+    await handle_document(upload("handbook.md", text), fake_bot, documents, embeddings)
+
+    embed_steps = [
+        edit["text"] for edit in fake_bot.edits if "эмбеддинги" in edit["text"]
+    ]
+    assert embed_steps
+    assert any("/" in step for step in embed_steps)
+    assert "проиндексирован" in last_chat_text(fake_bot)
+
+
+async def test_upload_continues_when_status_edit_fails(
+    documents, embeddings
+):
+    from tests.conftest import FakeBot
+
+    bot = FakeBot(edit_error=RuntimeError("telegram flood"))
+    await handle_document(upload("vacation_policy.txt"), bot, documents, embeddings)
+
+    assert [info.filename for info in await documents.list_documents(ALICE)] == [
+        "vacation_policy.txt"
+    ]
+    assert any("проиндексирован" in item["text"] for item in bot.sent)
+
+
+async def test_follow_up_search_uses_session_history(
+    fake_bot, documents, embeddings, memory
+):
+    """Короткий анафорический query с историей находит документ про отпуск."""
+    vacation = (
+        "Ежегодный отпуск составляет 28 календарных дней. "
+        "Неиспользованные дни отпуска переносятся на следующий календарный год."
+    )
+    hardware = (
+        "Администратор может перенести виртуальный сервер в другой датацентр "
+        "по заявке на обслуживание инфраструктуры."
+    )
+    await index_via_handler(
+        fake_bot, documents, embeddings, upload("vacation_policy.md", vacation)
+    )
+    await index_via_handler(
+        fake_bot, documents, embeddings, upload("hardware.md", hardware)
+    )
+    await memory.append_user(CHAT_ID, "Сколько дней ежегодного отпуска положено?")
+    await memory.append_assistant(
+        CHAT_ID, "28 календарных дней.\nИсточник: vacation_policy.md"
+    )
+    llm = make_scripted_llm(
+        [
+            search_documents_call("а можно перенести их?"),
+            assistant_turn(
+                content="Да, дни отпуска переносятся.\nИсточник: vacation_policy.md"
+            ),
+        ]
+    )
+
+    await handle_text(
+        FakeMessage("а можно перенести их?", chat_id=CHAT_ID, user_id=ALICE),
+        fake_bot,
+        llm,
+        memory,
+        SKILLS,
+        FakeCommandExecutor(),
+        documents=documents,
+        embeddings=embeddings,
+    )
+
+    tool_messages = [m for m in llm.requests[1] if m["role"] == "tool"]
+    assert "vacation_policy.md" in tool_messages[-1]["content"]
+    assert "переносятся" in tool_messages[-1]["content"]

@@ -5,10 +5,13 @@ import pytest
 from dev_helper_bot.document_store import (
     SEARCH_EMBEDDINGS_ERROR,
     SEARCH_NO_DOCUMENTS_MESSAGE,
+    ChunkMatch,
     DocumentStore,
     DocumentStoreUnavailable,
     UserDocumentSearcher,
     format_matches,
+    page_label,
+    sanitize_fts_query,
 )
 from dev_helper_bot.documents import chunk_text
 from tests.conftest import (
@@ -344,3 +347,195 @@ def test_fake_embeddings_are_deterministic_and_fixed_width():
     second = client._vector("одинаковый текст")
     assert first == second
     assert len(first) == FAKE_EMBEDDING_DIM
+
+
+async def test_open_rejects_missing_fts5(tmp_path, embeddings, monkeypatch):
+    import dev_helper_bot.document_store as store_module
+
+    async def no_fts(_db):
+        return False
+
+    monkeypatch.setattr(store_module, "fts5_is_available", no_fts)
+    store = DocumentStore(tmp_path / "rag.db", embeddings.dimension)
+
+    with pytest.raises(DocumentStoreUnavailable, match="FTS5"):
+        await store.open()
+
+
+async def test_open_migrates_legacy_chunks_and_fills_fts(tmp_path, embeddings):
+    """Старый rag.db без page_* и FTS открывается, FTS заполняется из текста."""
+    import sqlean
+    import sqlite_vec
+
+    path = tmp_path / "rag.db"
+    conn = sqlean.connect(str(path))
+    conn.enable_load_extension(True)
+    conn.load_extension(sqlite_vec.loadable_path())
+    conn.executescript(
+        """
+        CREATE TABLE documents (
+            id INTEGER PRIMARY KEY,
+            user_id INTEGER NOT NULL,
+            filename TEXT NOT NULL,
+            file_type TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            UNIQUE(user_id, filename)
+        );
+        CREATE TABLE chunks (
+            id INTEGER PRIMARY KEY,
+            document_id INTEGER NOT NULL REFERENCES documents(id),
+            chunk_index INTEGER NOT NULL,
+            text TEXT NOT NULL
+        );
+        """
+    )
+    conn.execute(
+        "CREATE VIRTUAL TABLE chunk_vectors USING vec0("
+        f"chunk_id INTEGER PRIMARY KEY, embedding float[{embeddings.dimension}] "
+        "distance_metric=cosine, user_id INTEGER PARTITION KEY)"
+    )
+    conn.execute(
+        "INSERT INTO documents (user_id, filename, file_type, created_at) "
+        "VALUES (?, ?, ?, ?)",
+        (ALICE, "legacy.txt", ".txt", "2026-01-01T00:00:00+00:00"),
+    )
+    conn.execute(
+        "INSERT INTO chunks (document_id, chunk_index, text) VALUES (1, 0, ?)",
+        ("уникальныйТокенQX9917 в старом индексе",),
+    )
+    conn.commit()
+    conn.close()
+
+    store = DocumentStore(path, embeddings.dimension)
+    await store.open()
+    try:
+        cursor = await store._conn.execute("PRAGMA table_info(chunks)")
+        columns = {row[1] for row in await cursor.fetchall()}
+        assert "page_start" in columns and "page_end" in columns
+        hits = await store.search_text(ALICE, "уникальныйТокенQX9917", k=5)
+        assert hits
+        assert hits[0].filename == "legacy.txt"
+    finally:
+        await store.close()
+
+
+async def test_fts_is_isolated_by_owner(store, embeddings):
+    await index(
+        store,
+        embeddings,
+        ALICE,
+        "secret.txt",
+        "уникальныйТокенQX9917 только в документе Алисы",
+    )
+    await index(store, embeddings, BOB, "other.txt", "обычный текст без того токена")
+
+    bob_fts = await store.search_text(BOB, "уникальныйТокенQX9917", k=5)
+    assert bob_fts == []
+    query_vec = (await embeddings.embed(["уникальныйТокенQX9917"]))[0]
+    bob_hybrid = await store.retrieve(BOB, "уникальныйТокенQX9917", query_vec, k=5)
+    assert all(match.filename != "secret.txt" for match in bob_hybrid)
+    alice_fts = await store.search_text(ALICE, "уникальныйТокенQX9917", k=5)
+    assert alice_fts[0].filename == "secret.txt"
+
+
+async def test_fts_special_characters_do_not_break_search(store, embeddings):
+    await index(store, embeddings, ALICE, "policy.txt", VACATION_POLICY)
+
+    assert sanitize_fts_query("*** (((") == ""
+    assert await store.search_text(ALICE, 'foo " OR bar', k=5) is not None
+    assert await store.search_text(ALICE, "***", k=5) == []
+
+
+async def test_retrieve_reranks_candidates_down_to_top_k(store, embeddings):
+    long_text = " ".join(
+        f"Пункт {i}: правила компании о работе и отпуске сотрудника." for i in range(40)
+    )
+    await index(store, embeddings, ALICE, "handbook.md", long_text)
+    assert len(chunk_text(long_text)) > 3
+    query_vec = (await embeddings.embed(["правила работы"]))[0]
+
+    matches = await store.retrieve(ALICE, "правила работы", query_vec, k=3)
+
+    assert 1 <= len(matches) <= 3
+
+
+async def test_retrieve_not_vec_only_when_fts_hits(store, embeddings, monkeypatch):
+    """Точный редкий токен добирается текстовым каналом, даже если vec пуст."""
+    await index(
+        store,
+        embeddings,
+        ALICE,
+        "codes.md",
+        "Код ошибки QX-9917 означает отказ в доступе к репозиторию.",
+    )
+
+    async def empty_vec(user_id, query_vector, k=5):
+        return []
+
+    monkeypatch.setattr(store, "search", empty_vec)
+    query_vec = (await embeddings.embed(["QX-9917"]))[0]
+    matches = await store.retrieve(ALICE, "QX-9917", query_vec, k=5)
+
+    assert matches
+    assert "QX-9917" in matches[0].text
+
+
+async def test_searcher_uses_conversation_context_for_follow_up(store, embeddings):
+    vacation = (
+        "Ежегодный отпуск 28 календарных дней. Неиспользованные дни отпуска "
+        "переносятся на следующий календарный год, но не более 10 дней."
+    )
+    hardware = (
+        "Администратор может перенести виртуальный сервер в другой датацентр "
+        "по заявке на обслуживание инфраструктуры."
+    )
+    await index(store, embeddings, ALICE, "vacation_policy.md", vacation)
+    await index(store, embeddings, ALICE, "hardware.md", hardware)
+    short = "а можно перенести их?"
+    with_history = UserDocumentSearcher(
+        store,
+        embeddings,
+        ALICE,
+        conversation_context="Сколько дней ежегодного отпуска положено сотруднику?",
+    )
+
+    result = await with_history.search(short)
+
+    assert "vacation_policy.md" in result
+    assert "переносятся" in result
+
+
+def test_format_matches_includes_pdf_page_or_range_but_not_for_md():
+    one_page = ChunkMatch(
+        filename="company_policy.pdf",
+        chunk_index=11,
+        text="правило",
+        distance=0.1,
+        page_start=17,
+        page_end=17,
+    )
+    spanning = ChunkMatch(
+        filename="company_policy.pdf",
+        chunk_index=12,
+        text="стык",
+        distance=0.2,
+        page_start=16,
+        page_end=17,
+    )
+    markdown = ChunkMatch(
+        filename="notes.md",
+        chunk_index=0,
+        text="заметка",
+        distance=0.3,
+    )
+
+    one = format_matches([one_page], "q")
+    span = format_matches([spanning], "q")
+    md = format_matches([markdown], "q")
+
+    assert "стр. 17" in one
+    assert "фрагмент 12" in one
+    assert "стр. 16–17" in span
+    assert "notes.md" in md
+    assert "стр." not in md
+    assert page_label(markdown) is None

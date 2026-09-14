@@ -68,16 +68,48 @@ class FakeMessage:
         self.document = document
 
 
+class FakeSentMessage:
+    """Возврат send_message: нужен message_id для edit_message_text."""
+
+    def __init__(self, message_id: int, chat_id: int, text: str) -> None:
+        self.message_id = message_id
+        self.chat = FakeChat(chat_id)
+        self.text = text
+
+
 class FakeBot:
     """Двойник aiogram Bot: записывает отправленные сообщения и отдаёт
     байты «скачанного» документа из самого двойника документа."""
 
-    def __init__(self, download_error: Exception | None = None) -> None:
+    def __init__(
+        self,
+        download_error: Exception | None = None,
+        edit_error: Exception | None = None,
+    ) -> None:
         self.sent: list[dict[str, Any]] = []
+        self.edits: list[dict[str, Any]] = []
         self.download_error = download_error
+        self.edit_error = edit_error
+        self._next_message_id = 1
 
-    async def send_message(self, chat_id: int, text: str) -> None:
+    async def send_message(self, chat_id: int, text: str) -> FakeSentMessage:
+        message_id = self._next_message_id
+        self._next_message_id += 1
         self.sent.append({"chat_id": chat_id, "text": text})
+        return FakeSentMessage(message_id=message_id, chat_id=chat_id, text=text)
+
+    async def edit_message_text(
+        self,
+        text: str,
+        chat_id: int | None = None,
+        message_id: int | None = None,
+        **_kwargs: Any,
+    ) -> None:
+        if self.edit_error is not None:
+            raise self.edit_error
+        self.edits.append(
+            {"chat_id": chat_id, "message_id": message_id, "text": text}
+        )
 
     async def download(self, document: Any, destination: Any) -> Any:
         if self.download_error is not None:

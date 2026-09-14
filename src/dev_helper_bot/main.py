@@ -35,9 +35,11 @@ from dev_helper_bot.document_store import DocumentStore, UserDocumentSearcher
 from dev_helper_bot.documents import (
     SUPPORTED_EXTENSIONS,
     DocumentError,
+    chunk_plain_texts,
+    chunks_from_text,
     ensure_upload_size,
+    extract_document,
     is_supported_document,
-    split_document,
 )
 from dev_helper_bot.embeddings import EmbeddingClient, EmbeddingsUnavailable
 from dev_helper_bot.llm import LLMClient, LLMUnavailable, Message
@@ -65,7 +67,10 @@ TELEGRAM_MESSAGE_LIMIT = 4096
 WAITING_MESSAGE = "⏳ Готовлю ответ…"
 NEW_CHAT_CONFIRMATION = "🆕 Контекст сброшен — начинаем новый диалог."
 
-INDEXING_MESSAGE = "⏳ Обрабатываю «{filename}» — извлекаю текст и строю индекс…"
+INDEXING_MESSAGE = "⏳ Получил «{filename}» — начинаю обработку…"
+INDEXING_EXTRACT_MESSAGE = "⏳ «{filename}»: извлекаю текст…"
+INDEXING_CHUNKS_MESSAGE = "⏳ «{filename}»: создано фрагментов {count}…"
+INDEXING_EMBED_MESSAGE = "⏳ «{filename}»: эмбеддинги {done}/{total}…"
 INDEXED_MESSAGE = (
     "✅ «{filename}» проиндексирован: фрагментов {count}. "
     "Можно задавать вопросы по документу."
@@ -104,6 +109,9 @@ AGENT_TOOLS = [
     LIST_TOOL_SPEC,
     SEARCH_DOCUMENTS_TOOL_SPEC,
 ]
+
+EMBEDDING_BATCH_SIZE = 32
+"""Размер батча эмбеддингов при индексации (add-rag-bonus D2): не env."""
 
 logging.basicConfig(
     level=logging.INFO,
@@ -162,7 +170,10 @@ async def handle_text(
     document_search = None
     if documents is not None and embeddings is not None:
         document_search = UserDocumentSearcher(
-            documents, embeddings, _sender_id(message)
+            documents,
+            embeddings,
+            _sender_id(message),
+            conversation_context=_conversation_search_context(session_history),
         )
 
     await bot.send_message(chat_id=chat_id, text=WAITING_MESSAGE)
@@ -210,6 +221,49 @@ def _sender_id(message: TgMessage) -> int:
     return user.id if user is not None else message.chat.id
 
 
+def _conversation_search_context(history: list[Message]) -> str:
+    """Последний user и, если есть, последний assistant до текущего сообщения."""
+    last_user = ""
+    last_assistant = ""
+    for item in reversed(history):
+        role = item.get("role")
+        content = (item.get("content") or "").strip()
+        if not content:
+            continue
+        if role == "user" and not last_user:
+            last_user = content
+        elif role == "assistant" and not last_assistant:
+            last_assistant = content
+        if last_user and last_assistant:
+            break
+    if last_user and last_assistant:
+        return f"{last_user}\n{last_assistant}"
+    return last_user or last_assistant
+
+
+async def _update_status(
+    bot: Bot,
+    chat_id: int,
+    message_id: int | None,
+    text: str,
+) -> int | None:
+    """Редактирует статус индексации; сбой edit не валит обработку (D1)."""
+    if message_id is not None:
+        try:
+            await bot.edit_message_text(
+                text=text, chat_id=chat_id, message_id=message_id
+            )
+            return message_id
+        except Exception:
+            log.warning("cannot edit indexing status message", exc_info=True)
+    try:
+        sent = await bot.send_message(chat_id=chat_id, text=text)
+        return getattr(sent, "message_id", None)
+    except Exception:
+        log.warning("cannot send indexing status message", exc_info=True)
+        return message_id
+
+
 async def download_document(bot: Bot, document) -> bytes:
     """Скачивает файл Telegram в память: на диск он не кладётся (design: сырые
     файлы после индексации не храним)."""
@@ -255,49 +309,107 @@ async def handle_document(
         )
         return
 
-    await bot.send_message(
+    sent = await bot.send_message(
         chat_id=chat_id, text=INDEXING_MESSAGE.format(filename=filename)
     )
+    status_id = getattr(sent, "message_id", None)
     try:
         data = await download_document(bot, document)
     except Exception:
         log.warning("cannot download document %s", filename, exc_info=True)
-        await bot.send_message(
-            chat_id=chat_id, text=DOWNLOAD_ERROR_MESSAGE.format(filename=filename)
+        await _update_status(
+            bot,
+            chat_id,
+            status_id,
+            DOWNLOAD_ERROR_MESSAGE.format(filename=filename),
         )
         return
 
     try:
         ensure_upload_size(len(data), rag_max_upload_bytes())
-        chunks = split_document(
-            filename,
-            data,
+        status_id = await _update_status(
+            bot,
+            chat_id,
+            status_id,
+            INDEXING_EXTRACT_MESSAGE.format(filename=filename),
+        )
+        text, page_spans = extract_document(filename, data)
+        chunks = chunks_from_text(
+            text,
+            page_spans,
             max_chars=rag_max_extract_chars(),
             max_chunks=rag_max_chunks_per_doc(),
         )
+        status_id = await _update_status(
+            bot,
+            chat_id,
+            status_id,
+            INDEXING_CHUNKS_MESSAGE.format(filename=filename, count=len(chunks)),
+        )
     except DocumentError as exc:
-        await bot.send_message(
-            chat_id=chat_id,
-            text=DOCUMENT_ERROR_TEMPLATE.format(filename=filename, reason=exc),
+        await _update_status(
+            bot,
+            chat_id,
+            status_id,
+            DOCUMENT_ERROR_TEMPLATE.format(filename=filename, reason=exc),
         )
         return
 
     try:
-        vectors = await embeddings.embed(chunks)
+        vectors, status_id = await _embed_chunks(
+            embeddings,
+            chunk_plain_texts(chunks),
+            filename=filename,
+            bot=bot,
+            chat_id=chat_id,
+            status_id=status_id,
+        )
     except EmbeddingsUnavailable as exc:
         log.warning("embeddings unavailable while indexing %s: %s", filename, exc)
-        await bot.send_message(
-            chat_id=chat_id, text=EMBEDDINGS_ERROR_MESSAGE.format(filename=filename)
+        await _update_status(
+            bot,
+            chat_id,
+            status_id,
+            EMBEDDINGS_ERROR_MESSAGE.format(filename=filename),
         )
         return
 
     count = await documents.index_document(
         _sender_id(message), filename, chunks, vectors
     )
-    await bot.send_message(
-        chat_id=chat_id,
-        text=INDEXED_MESSAGE.format(filename=filename, count=count),
+    await _update_status(
+        bot,
+        chat_id,
+        status_id,
+        INDEXED_MESSAGE.format(filename=filename, count=count),
     )
+
+
+async def _embed_chunks(
+    embeddings: EmbeddingClient,
+    texts: list[str],
+    *,
+    filename: str,
+    bot: Bot,
+    chat_id: int,
+    status_id: int | None,
+) -> tuple[list[list[float]], int | None]:
+    """Эмбеддинги батчами с прогрессом k/N; запись в индекс — после всех батчей."""
+    total = len(texts)
+    vectors: list[list[float]] = []
+    batch_size = max(1, EMBEDDING_BATCH_SIZE)
+    for start in range(0, total, batch_size):
+        batch = texts[start : start + batch_size]
+        vectors.extend(await embeddings.embed(batch))
+        status_id = await _update_status(
+            bot,
+            chat_id,
+            status_id,
+            INDEXING_EMBED_MESSAGE.format(
+                filename=filename, done=len(vectors), total=total
+            ),
+        )
+    return vectors, status_id
 
 
 async def handle_documents(
