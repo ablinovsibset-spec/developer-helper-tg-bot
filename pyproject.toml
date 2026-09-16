@@ -37,7 +37,8 @@ where = ["src"]
 testpaths = ["tests"]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
-addopts = "-m 'not docker'"
+addopts = "-m 'not docker and not live'"
 markers = [
     "docker: интеграционные тесты реальной Docker-песочницы (запуск: pytest -m docker; требует установленный и запущенный Docker)",
+    "live: тесты против живого LLM и routerai-судьи (запуск: pytest -m live; требует доступный LLM-эндпоинт, для судьи — LLM_API_KEY)",
 ]

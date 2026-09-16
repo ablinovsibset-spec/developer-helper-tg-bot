@@ -311,7 +311,7 @@ chunk_fts USING fts5(text, content='chunks', content_rowid='id')
 
 ### Evaluation dataset
 
-`eval/` содержит корпус политик (`eval/documents/*.md`) и набор вопросов с ожидаемым источником (`eval/rag_eval_dataset.json`, 8 вопросов). Проверка попадания ожидаемого источника и самого факта в Top-K идёт **тем же гибридным retrieve**, что и инструмент поиска, и входит в дефолтный прогон тестов:
+`eval/` содержит корпус политик (`eval/documents/*.md`), набор вопросов с ожидаемым источником (`eval/rag_eval_dataset.json`, 8 вопросов) и датасет ядра агента (`eval/agent_eval_dataset.json`: jailbreak, отказ, память, `/new`, JSON-аргументы инструментов, открытые вопросы для судьи). Проверка попадания ожидаемого источника и самого факта в Top-K идёт **тем же гибридным retrieve**, что и инструмент поиска, и входит в дефолтный прогон тестов:
 
 ```bash
 pytest tests/unit/test_rag_eval.py
@@ -405,11 +405,22 @@ frontmatter (из in-memory набора, загруженного при ста
 
 ```bash
 # внутри venv хоста (разработка) или ~/.venv-devbot внутри сандбокса
-pytest                # дефолтный hermetic-набор: без сети, секретов и Docker
+pytest                # дефолтный hermetic-набор: без сети, секретов, Docker и живого LLM
 pytest -m docker      # интеграционные тесты песочницы (нужен запущенный Docker-демон)
+pytest -m live        # red team / отказ / память / latency / LLM-as-a-Judge
 ```
 
 Дефолтный набор не требует сети и секретов: LLM и эмбеддинги подменяются фейками (у эмбеддингов — детерминированные векторы, поэтому retrieval проверяется на релевантности), исполнитель команд — двойником без Docker, индекс документов — файлом в `tmp_path`. Docker-тесты проверяют жизненный цикл жителя: персистентность файлов/пакетов между сообщениями, удаление при завершении, самовосстановление, sweep и сборку образа.
+
+`pytest -m live` ходит в реальный chat-endpoint из env (`make_llm()`, как у бота) для red team, отказа, памяти и latency. LLM-as-a-Judge всегда бьёт в агрегатор `https://routerai.ru/api/v1`, а не в `LLM_BASE_URL` бота: субъект `openai/gpt-5.6-luna` (`JUDGE_SUBJECT_MODEL`), судья `openai/gpt-5.6-sol` (`JUDGE_MODEL`). Нет ключа или LLM недоступен — соответствующие тесты `skip`, дефолтный `pytest` от этого не падает.
+
+| Переменная | Дефолт | Назначение |
+|---|---|---|
+| `LLM_API_KEY` | — | Ключ клиента: live red team/latency через `make_llm()` и оба вызова судьи |
+| `JUDGE_SUBJECT_MODEL` | `openai/gpt-5.6-luna` | Модель, которая отвечает на открытые вопросы судьи |
+| `JUDGE_MODEL` | `openai/gpt-5.6-sol` | Модель-судья (вежливость / точность / краткость, среднее ≥ 0.8) |
+| `LIVE_FULL_SECONDS` | `4` | Порог полного `complete()` короткого пинга |
+| `LIVE_TTFT_SECONDS` | `1.5` | Порог TTFT по SSE-зонду `stream=true`; нет streaming — skip только этого теста |
 
 ## Структура проекта
 
@@ -429,8 +440,8 @@ src/dev_helper_bot/   исходный код пакета
   config.py           настройки и фабрика LLM (пути БД, виртуальный прайс)
   llm/                подпакет доступа к LLM (контракт с tool-calling и usage)
 skills/               текстовые скиллы агента (данные, не код)
-eval/                 evaluation dataset для retrieval (корпус политик + вопросы с ожидаемым источником)
-tests/                тесты (unit/, integration/ — включая docker-маркированные)
+eval/                 evaluation datasets: RAG retrieval и ядро агента (jailbreak / JSON / судья)
+tests/                тесты (unit/, integration/ с маркером docker, live/ с маркером live)
 Dockerfile            образ контейнера-жителя (Alpine + curl + python3)
 scripts/              runbook-скрипты (sbx-setup.sh, sbx-start.sh, sbx-stop.sh)
 scripts/obs-dashboard.py  дашборд телеметрии (агрегаты + timeline прогона)

@@ -2,8 +2,10 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import math
 import re
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -20,6 +22,21 @@ from dev_helper_bot.tools import EXEC_TIMEOUT_SECONDS, ExecResult
 
 
 DEFAULT_USER_ID = 777
+
+AGENT_EVAL_DATASET_PATH = (
+    Path(__file__).resolve().parents[1] / "eval" / "agent_eval_dataset.json"
+)
+
+
+def load_agent_eval_dataset() -> dict[str, Any]:
+    return json.loads(AGENT_EVAL_DATASET_PATH.read_text(encoding="utf-8"))
+
+
+def agent_eval_cases(*kinds: str) -> list[dict[str, Any]]:
+    cases = load_agent_eval_dataset()["cases"]
+    if not kinds:
+        return cases
+    return [case for case in cases if case["kind"] in kinds]
 
 
 class FakeChat:
