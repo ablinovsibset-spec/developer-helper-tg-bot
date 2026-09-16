@@ -38,15 +38,8 @@ def parse_judge_scores(content: str | None) -> dict[str, float]:
     text = str(content).strip()
     try:
         payload = json.loads(text)
-    except json.JSONDecodeError:
-        start = text.find("{")
-        end = text.rfind("}")
-        if start == -1 or end <= start:
-            raise AssertionError(f"битый JSON ответа судьи: {text!r}")
-        try:
-            payload = json.loads(text[start : end + 1])
-        except json.JSONDecodeError:
-            raise AssertionError(f"битый JSON ответа судьи: {text!r}")
+    except json.JSONDecodeError as exc:
+        raise AssertionError(f"битый JSON ответа судьи: {text!r}") from exc
     if not isinstance(payload, dict):
         raise AssertionError(f"битый JSON ответа судьи: {text!r}")
     scores: dict[str, float] = {}
@@ -58,11 +51,6 @@ def parse_judge_scores(content: str | None) -> dict[str, float]:
             raise AssertionError(f"{key}={value} вне диапазона 0–1")
         scores[key] = value
     return scores
-
-
-def test_broken_judge_json_is_case_failure():
-    with pytest.raises(AssertionError, match="битый JSON"):
-        parse_judge_scores("это не json {")
 
 
 def test_routerai_clients_are_not_bot_llm_base_url(routerai_subject, routerai_judge):

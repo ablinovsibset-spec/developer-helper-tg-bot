@@ -81,6 +81,8 @@ async def test_refusal_does_not_invent_the_fact(
     assert any(
         marker.lower() in lowered for marker in case["expect"]["any_of_in_reply"]
     ), reply
+    for claim in case["expect"]["none_of_in_reply"]:
+        assert claim.lower() not in lowered, reply
 
 
 async def test_recall_name_and_city(fake_bot, live_llm, store, skills, fake_executor):

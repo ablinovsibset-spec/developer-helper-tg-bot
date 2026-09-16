@@ -50,6 +50,17 @@ def test_dataset_has_at_least_ten_unique_ids_and_l2_kinds():
     assert set(L2_KINDS) <= kinds
 
 
+def test_refusal_cases_list_prohibited_claims():
+    for case in agent_eval_cases("refusal"):
+        prohibited = case["expect"]["none_of_in_reply"]
+        assert prohibited, case["id"]
+        markers = [marker.lower() for marker in case["expect"]["any_of_in_reply"]]
+        for claim in prohibited:
+            lowered = claim.lower()
+            assert lowered not in markers
+            assert not any(marker in lowered for marker in markers)
+
+
 @pytest.mark.parametrize(
     "case",
     agent_eval_cases("jailbreak"),

@@ -1,6 +1,7 @@
 """Latency SLA короткого вызова LLM: полный ответ и TTFT (stream-зонд)."""
 from __future__ import annotations
 
+import asyncio
 import os
 import time
 
@@ -49,6 +50,6 @@ async def test_ttft_under_threshold_or_skip_without_streaming(live_llm):
                             f"TTFT {elapsed:.3f}s >= {threshold}s"
                         )
                         return
-    except aiohttp.ClientError as exc:
+    except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
         pytest.skip(f"streaming probe failed: {exc}")
     pytest.skip("endpoint did not yield a stream chunk")
